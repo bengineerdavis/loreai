@@ -36,7 +36,6 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
   buildProviderRegistrations,
-  gatewayAccessHeadersForRemote,
   resolveGatewayUrl,
   runCompaction,
   type SessionBeforeCompactResult,
@@ -119,7 +118,6 @@ export default async function lorePiExtension(pi: ExtensionAPI): Promise<void> {
   // x-lore-session-title so the gateway can persist it (#1921).
   let currentSessionTitle = "";
   let compactAuthHeaders: Record<string, string> = {};
-  const gatewayAccessHeaders = gatewayAccessHeadersForRemote(gatewayBase);
 
   let cachedGitRemote = getGitRemote(projectPath) ?? "";
 
@@ -136,7 +134,6 @@ export default async function lorePiExtension(pi: ExtensionAPI): Promise<void> {
       gatewayBase,
       getHeaders: () => {
         const headers: Record<string, string> = {
-          ...gatewayAccessHeaders,
           "x-lore-session-id": currentSessionID,
           "x-lore-project": projectPath,
         };
@@ -234,7 +231,7 @@ export default async function lorePiExtension(pi: ExtensionAPI): Promise<void> {
         previousSummary: event.preparation.previousSummary,
         firstKeptEntryId: event.preparation.firstKeptEntryId,
         tokensBefore: event.preparation.tokensBefore,
-        authHeaders: { ...gatewayAccessHeaders, ...compactAuthHeaders },
+        authHeaders: { ...compactAuthHeaders },
       }),
   );
 }

@@ -15,7 +15,7 @@
  */
 
 import type { PluginInput } from "@opencode-ai/plugin";
-import { GATEWAY_AUTH_HEADER, log } from "@loreai/core";
+import { log } from "@loreai/core";
 import * as http from "node:http";
 import * as https from "node:https";
 
@@ -78,18 +78,6 @@ export function isLoopbackUrl(value: string): boolean {
   } catch {
     return false;
   }
-}
-
-/** Access headers are injected only for the URL selected by LORE_REMOTE_URL. */
-export function gatewayAccessHeadersForRemote(
-  gatewayBase: string,
-  env: NodeJS.ProcessEnv = process.env,
-): Record<string, string> {
-  const remoteUrl = env.LORE_REMOTE_URL?.replace(/\/+$/, "");
-  const token = env.LORE_GATEWAY_AUTH_TOKEN;
-  return remoteUrl === gatewayBase.replace(/\/+$/, "") && token
-    ? { [GATEWAY_AUTH_HEADER]: token }
-    : {};
 }
 
 /** Provider and Lore credentials are applied by the gateway, never this hop. */
