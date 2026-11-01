@@ -287,31 +287,22 @@ describe("LorePlugin hooks", () => {
 });
 
 describe("plugin entry module export shape", () => {
-  // Regression guard for the v1.17.4 crash (`undefined is not an object
-  // (evaluating 'A.event')`). OpenCode's legacy plugin loader iterates
-  // `Object.values(mod)` (`getLegacyPlugins`/`getServerPlugin`): every
-  // FUNCTION export is invoked as a plugin (and its return value pushed into
-  // the host hooks array — `applyLoreProviderConfig` returned `undefined`,
-  // which then crashed the dispatch loops), and every NON-function export
-  // makes the loader throw `Plugin export is not a function`, dropping the
-  // plugin entirely. So the entry module must export ONLY the plugin (the
-  // named `LorePlugin` and the same-reference `default`) — nothing else.
-  test("exports only the plugin (LorePlugin + same-ref default)", async () => {
+  // OpenCode 1.18.29+ invokes default.server; V2 invokes default.setup.
+  // The named function remains available to older V1 hosts. Keep helpers out
+  // of this entry: a second function export would be treated as another
+  // legacy plugin and could put an invalid hook object into the host.
+  test("exposes the supported dual contract without helper exports", async () => {
     const mod = (await import("../src/index")) as Record<string, unknown>;
 
-    // The default export must be the LorePlugin function reference.
-    expect(typeof mod.default).toBe("function");
-    expect(mod.default).toBe(mod.LorePlugin);
-
-    // The ONLY export keys allowed are `LorePlugin` and `default`. Any other
-    // export — function OR not — breaks the legacy loader (functions get
-    // invoked as bogus plugins; non-functions make it throw). This is the
-    // strict guard: it catches both failure modes, including a future
-    // `export const FOO = ...` that a function-only filter would miss.
+    expect(mod.default).toMatchObject({ id: "lore" });
+    const definition = mod.default as {
+      server: unknown;
+      setup: unknown;
+    };
+    expect(definition.server).toBe(mod.LorePlugin);
+    expect(typeof definition.setup).toBe("function");
     expect(Object.keys(mod).sort()).toEqual(["LorePlugin", "default"]);
 
-    // Belt-and-suspenders: simulate getLegacyPlugins' reference dedup so the
-    // host invokes exactly one plugin function (the named + default pair).
     const uniqueFns = new Set<unknown>(
       Object.values(mod).filter((value) => typeof value === "function"),
     );

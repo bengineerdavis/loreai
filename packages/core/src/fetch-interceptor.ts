@@ -933,6 +933,63 @@ async function fetchWithContextBoundary(
   );
 }
 
+/**
+ * Adapt one supported host HTTP request for the gateway without patching
+ * global fetch. The original request remains untouched, so a host can leave it
+ * unchanged when its gateway probe fails. Context-boundary elision stays with
+ * the V1 interceptor; this path always forwards the complete request body.
+ */
+export function createGatewayRequest(
+  request: Request,
+  gatewayBase: string,
+  attribution: Record<string, string> = {},
+): Request | null {
+  try {
+    const upstream = new URL(request.url);
+    if (
+      isDirectGatewayRequest(upstream, gatewayBase) ||
+      (!matchesLLMApiPath(upstream.pathname) &&
+        !isLocalInterceptionHost(upstream.hostname))
+    ) {
+      return null;
+    }
+    const gateway = new URL(gatewayBase);
+    let rewrite = interceptUrl(upstream, gateway);
+    // V2's supported HTTP hook must also cover loopback providers. Global-fetch
+    // interception deliberately skips those hosts to avoid loops, but this hook
+    // sees only provider calls. Canonicalize bare local endpoints to the
+    // gateway's registered /v1 routes while preserving the original upstream.
+    if (!rewrite && isLocalInterceptionHost(upstream.hostname)) {
+      const canonical = [
+        ["/chat/completions", "/v1/chat/completions"],
+        ["/codex/responses", "/v1/codex/responses"],
+        ["/responses", "/v1/responses"],
+        ["/messages", "/v1/messages"],
+      ].find(([suffix]) => upstream.pathname.endsWith(suffix));
+      if (canonical) {
+        const [suffix, route] = canonical;
+        rewrite = {
+          gatewayUrl: `${gateway.origin}${route}${upstream.search}`,
+          upstreamBase:
+            upstream.origin + upstream.pathname.slice(0, -suffix.length),
+          upstreamPath: upstreamRequestTarget(upstream),
+        };
+      }
+    }
+    if (!rewrite) return null;
+    const headers = buildGatewayHeaders(
+      request,
+      undefined,
+      rewrite.upstreamBase,
+      rewrite.upstreamPath,
+      { gatewayBase, getHeaders: () => attribution },
+    );
+    return new Request(new Request(rewrite.gatewayUrl, request), { headers });
+  } catch {
+    return null;
+  }
+}
+
 export function installFetchInterceptor(
   config: FetchInterceptorConfig,
 ): () => void {

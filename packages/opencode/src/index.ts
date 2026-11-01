@@ -1,4 +1,5 @@
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
+import { definition as v2Definition } from "./v2";
 import {
   log,
   getGitRemote,
@@ -684,10 +685,9 @@ export const LorePlugin: Plugin = async (ctx) => {
   }
 };
 
-// WARNING: do NOT add any other export to this module. OpenCode's legacy
-// plugin loader invokes every FUNCTION export as a plugin (pushing its return
-// value into the host hooks array) and THROWS on any non-function export,
-// dropping the plugin entirely. Keep helpers in ./internal.ts. This module
-// must export only LorePlugin + this same-reference default. Guarded by the
-// "plugin entry module export shape" test in test/index.test.ts.
-export default LorePlugin;
+// OpenCode 1.18.29+ supports this object entrypoint: it invokes server(),
+// while V2 invokes setup(). Older V1 hosts retain the named function export.
+export default {
+  ...v2Definition,
+  server: LorePlugin,
+};

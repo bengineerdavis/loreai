@@ -927,6 +927,7 @@ const GATEWAY_MANAGED_HEADERS = new Set([
   "x-lore-project",
   "x-lore-git-remote",
   "x-lore-agent",
+  "x-lore-native-turn-id",
   "x-lore-session-title",
   "x-lore-session-parent-state",
   "x-lore-no-store",

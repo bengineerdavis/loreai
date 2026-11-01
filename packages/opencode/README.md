@@ -8,17 +8,19 @@ An implementation of [Sanity's Nuum](https://www.sanity.io/blog/how-we-solved-th
 
 ## Install
 
-Add to your project's `opencode.json`:
+For OpenCode 2.x, add to your project's `opencode.json(c)`:
 
 ```json
 {
-  "plugin": [
-    "@loreai/opencode"
-  ]
+  "plugins": ["@loreai/opencode"]
 }
 ```
 
-Restart OpenCode and the plugin will be installed automatically.
+OpenCode 2.2.2 and later loads the V2 `setup()` contract. OpenCode 1.18.29 and later uses the same package's V1 `server()` entrypoint; the named `LorePlugin` function remains available to older V1 hosts. Install OpenCode 2 with the V2 installer, not the V1 installer.
+
+The V2 adapter uses native session HTTP hooks to record provider traffic through a healthy Lore gateway. It also covers loopback providers, preserves their original upstream targets, and registers the native recall tool. A per-request health check leaves the configured upstream unchanged when the gateway is unavailable. These checks distinguish plugin loading from actual recording; a healthy gateway or plugin export alone does not prove either.
+
+V2 limitations: there is no global mutable config hook for the V1 compaction and provider rewrites, so V2 does not disable OpenCode compaction or register hidden worker agents. Native HTTP routes carry the complete request body; V1 context-boundary elision is not reproduced. The V2 HTTP hooks expose no transport-error recovery seam, so fallback is supported before a request is routed, not replay after a gateway fails mid-request. WebSocket provider traffic is not intercepted. Do not treat these unproven behaviors as V1 parity.
 
 > This package is also published as [`opencode-lore`](https://www.npmjs.com/package/opencode-lore) (legacy alias). Both names ship identical code at every release — either works.
 

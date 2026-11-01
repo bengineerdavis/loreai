@@ -463,6 +463,7 @@ export {
   CODEX_CONTEXT_BOUNDARY_MISMATCH_HEADER,
   installFetchInterceptor,
   shouldIntercept,
+  createGatewayRequest,
   type FetchInterceptorConfig,
 } from "./fetch-interceptor";
 export * as workerModel from "./worker-model";
