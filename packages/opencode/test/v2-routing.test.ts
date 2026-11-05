@@ -19,13 +19,20 @@ const originalEnvironment = { ...process.env };
 
 type Context = Parameters<NonNullable<typeof plugin.setup>>[0];
 type Hooks = {
-  [Kind in "prompt" | "http.request" | "http.response"]: Array<
-    (event: never) => Promise<void> | void
-  >;
+  [Kind in
+    | "prompt"
+    | "model.request"
+    | "http.request"
+    | "http.response"]: Array<(event: never) => Promise<void> | void>;
 };
 
-async function harness() {
-  const hooks: Hooks = { prompt: [], "http.request": [], "http.response": [] };
+async function harness({ resetModules = true } = {}) {
+  const hooks: Hooks = {
+    prompt: [],
+    "model.request": [],
+    "http.request": [],
+    "http.response": [],
+  };
   const tools: Array<{ name: string }> = [];
   const ctx = {
     location: {
@@ -52,7 +59,7 @@ async function harness() {
       },
     },
   } as unknown as Context;
-  vi.resetModules();
+  if (resetModules) vi.resetModules();
   const candidate = (await import("../src/index")).default;
   await candidate.setup?.(ctx);
   return { hooks, tools };
@@ -76,6 +83,7 @@ function request(message: string): Request {
 describe("V2 native HTTP routing", () => {
   let gateway: Server;
   let baseURL: string;
+  let failHealth = false;
   const seen: Array<{
     url: string;
     headers: Record<string, string>;
@@ -87,6 +95,11 @@ describe("V2 native HTTP routing", () => {
     process.env.LORE_OPENCODE_FORCE_ACTIVE = "1";
     globalThis.fetch = originalFetch;
     gateway = createServer((req, res) => {
+      if (req.url === "/health" && failHealth) {
+        res.writeHead(503);
+        res.end("unavailable");
+        return;
+      }
       const chunks: Buffer[] = [];
       req.on("data", (chunk) => chunks.push(chunk));
       req.on("end", () => {
@@ -128,9 +141,19 @@ describe("V2 native HTTP routing", () => {
     for (const hook of hooks.prompt) {
       await hook({ sessionID: "v2-session", messageID: "v2-turn" } as never);
     }
+    const modelEvent = {
+      sessionID: "v2-session",
+      agent: "build",
+      model: { providerID: "synthetic", id: "synthetic-model" },
+      kind: "primary",
+      headers: {} as Record<string, string>,
+    };
+    for (const hook of hooks["model.request"]) await hook(modelEvent as never);
     for (const hook of hooks["http.request"]) await hook(event as never);
+    expect(modelEvent.headers["x-lore-provider"]).toBe("synthetic");
     expect(event.request.url).toBe(`${baseURL}/v1/messages`);
     expect(event.request.headers.get("x-lore-session-id")).toBe("v2-session");
+    expect(event.request.headers.get("x-lore-provider")).toBe("synthetic");
     expect(event.request.headers.get("x-lore-native-turn-id")).toBe("v2-turn");
     expect(event.request.headers.get("x-lore-upstream-url")).toBe(
       "https://api.anthropic.com",
@@ -167,6 +190,105 @@ describe("V2 native HTTP routing", () => {
     expect(event.request.headers.get("x-lore-upstream-path")).toBe("/messages");
   });
 
+  test("adds provider identity to an already-routed provider without recursion", async () => {
+    process.env.LORE_GATEWAY_URL = baseURL;
+    const { hooks } = await harness();
+    const event = {
+      sessionID: "v2-openrouter-session",
+      agent: "build",
+      model: { providerID: "openrouter", id: "deepseek/deepseek-v4.1-flash" },
+      kind: "primary",
+      request: new Request(`${baseURL}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "deepseek/deepseek-v4.1-flash",
+          messages: [{ role: "user", content: "already-routed-marker" }],
+        }),
+      }),
+    };
+    const modelEvent = {
+      sessionID: "v2-openrouter-session",
+      agent: "build",
+      model: { providerID: "openrouter", id: "deepseek/deepseek-v4.1-flash" },
+      kind: "primary",
+      headers: {} as Record<string, string>,
+    };
+    for (const hook of hooks["model.request"]) await hook(modelEvent as never);
+    for (const hook of hooks["http.request"]) await hook(event as never);
+    expect(modelEvent.headers["x-lore-provider"]).toBe("openrouter");
+    expect(event.request.url).toBe(`${baseURL}/v1/chat/completions`);
+    expect(event.request.headers.get("x-lore-provider")).toBe("openrouter");
+    expect(event.request.headers.get("x-lore-session-id")).toBe(
+      "v2-openrouter-session",
+    );
+    expect(event.request.headers.get("x-lore-upstream-url")).toBeNull();
+  });
+
+  test("retries a failed gateway without leaking metadata into the fallback", async () => {
+    process.env.LORE_GATEWAY_URL = "http://127.0.0.1:1";
+    const { hooks } = await harness();
+    const modelEvent = {
+      sessionID: "v2-recovery-session",
+      agent: "build",
+      model: { providerID: "openrouter", id: "deepseek/deepseek-v4.1-flash" },
+      kind: "primary",
+      headers: {} as Record<string, string>,
+    };
+    for (const hook of hooks["model.request"]) await hook(modelEvent as never);
+    expect(modelEvent.headers["x-lore-provider"]).toBeUndefined();
+
+    // The failed gateway becomes healthy before the next model request. No
+    // module reset or fresh setup is required to discover it again.
+    process.env.LORE_GATEWAY_URL = baseURL;
+    const recoveredEvent = {
+      ...modelEvent,
+      headers: {} as Record<string, string>,
+    };
+    for (const hook of hooks["model.request"]) {
+      await hook(recoveredEvent as never);
+    }
+    expect(recoveredEvent.headers["x-lore-provider"]).toBe("openrouter");
+  });
+
+  test("strips stale Lore metadata when the gateway fails between hooks", async () => {
+    process.env.LORE_GATEWAY_URL = baseURL;
+    const { hooks } = await harness();
+    const event = {
+      sessionID: "v2-stale-session",
+      agent: "build",
+      model: { providerID: "openrouter", id: "deepseek/deepseek-v4.1-flash" },
+      kind: "primary",
+      request: new Request(`${baseURL}/v1/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({
+          model: "deepseek/deepseek-v4.1-flash",
+          messages: [],
+        }),
+      }),
+    };
+    for (const hook of hooks["http.request"]) await hook(event as never);
+    expect(event.request.headers.get("x-lore-provider")).toBe("openrouter");
+
+    failHealth = true;
+    const fallback = new Request(event.request.url, {
+      method: "POST",
+      headers: event.request.headers,
+      body: JSON.stringify({
+        model: "deepseek/deepseek-v4.1-flash",
+        messages: [],
+      }),
+    });
+    event.request = fallback;
+    for (const hook of hooks["http.request"]) await hook(event as never);
+    expect(event.request.url).toBe(`${baseURL}/v1/chat/completions`);
+    for (const [name] of event.request.headers) {
+      expect(name.startsWith("x-lore-")).toBe(false);
+    }
+    expect(event.request.headers.has("x-parent-session-id")).toBe(false);
+    failHealth = false;
+  });
+
   test("leaves the configured upstream unchanged when the gateway is unavailable", async () => {
     process.env.LORE_GATEWAY_URL = "http://127.0.0.1:1";
     const { hooks } = await harness();
@@ -177,7 +299,16 @@ describe("V2 native HTTP routing", () => {
       kind: "primary",
       request: request("upstream-must-still-work"),
     };
+    const modelEvent = {
+      sessionID: "v2-fallback",
+      agent: "build",
+      model: { providerID: "synthetic", id: "synthetic-model" },
+      kind: "primary",
+      headers: {} as Record<string, string>,
+    };
+    for (const hook of hooks["model.request"]) await hook(modelEvent as never);
     for (const hook of hooks["http.request"]) await hook(event as never);
+    expect(modelEvent.headers["x-lore-provider"]).toBeUndefined();
     expect(event.request.url).toBe("https://api.anthropic.com/v1/messages");
     expect(event.request.headers.get("x-lore-session-id")).toBeNull();
     expect(event.request.headers.get("x-lore-upstream-url")).toBeNull();

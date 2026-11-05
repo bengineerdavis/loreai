@@ -60,6 +60,7 @@ function forceActive(): boolean {
 
 async function initializeGateway(): Promise<string | null> {
   if (disabled()) return null;
+  if (gatewayBase) return gatewayBase;
   if (gatewayInit) return gatewayInit;
   gatewayInit = (async () => {
     const explicitGateway = Boolean(
@@ -84,9 +85,20 @@ async function initializeGateway(): Promise<string | null> {
       log.info(`routing through ${new URL(result).origin}`);
       log.info(`dashboard available at ${new URL(result).origin}/ui`);
     }
+    processInitDone = true;
+  } else {
+    // A failed explicit gateway is not a permanent process-wide verdict.
+    // Retry on a later setup/model request; while it is unavailable, direct
+    // provider traffic must carry no Lore-only routing or identity metadata.
+    gatewayInit = undefined;
   }
-  processInitDone = true;
   return result;
+}
+
+async function activeGateway(): Promise<string | null> {
+  if (!gatewayBase) await initializeGateway();
+  if (!gatewayBase || !(await probeGateway(gatewayBase))) return null;
+  return gatewayBase;
 }
 
 function upstreamExtras(): Record<string, string> {
@@ -193,14 +205,35 @@ function recallDefinition(ctx: Context): ToolInfo {
   };
 }
 
+function withoutLoreRouting(headers: Headers): void {
+  // model.request runs before the native health check. If the gateway fails
+  // between those boundaries, its metadata must not travel to the provider.
+  for (const name of Array.from(headers.keys())) {
+    if (name.startsWith("x-lore-") || name === "x-parent-session-id") {
+      headers.delete(name);
+    }
+  }
+}
+
 async function prepareRequest(ctx: Context, event: HttpRequest) {
-  if (!gatewayBase) return;
+  if (!(await activeGateway())) {
+    withoutLoreRouting(event.request.headers);
+    return;
+  }
   const projectPath = discoverWorkspaceRoot(ctx.location.directory);
   const turn = turns.get(event.sessionID);
   const metadata = await sessionMetadataFor(ctx, event.sessionID);
   const providerID = event.model.providerID;
-  const headers = new Headers(event.request.headers);
-  Object.assign(headers, gatewayAccessHeadersForRemote(gatewayBase));
+  // OpenCode honors header edits made on the native request. A replacement
+  // Request takes a separate body-replay path; keep the native object when
+  // the static provider config already points at Lore, so direct-gateway
+  // recursion protection cannot discard the attribution added here.
+  const headers = event.request.headers;
+  for (const [key, value] of Object.entries(
+    gatewayAccessHeadersForRemote(gatewayBase),
+  )) {
+    headers.set(key, value);
+  }
   for (const [key, value] of Object.entries({
     ...upstreamExtras(),
     "x-lore-session-id": event.sessionID,
@@ -265,10 +298,18 @@ export const definition = Plugin.define({
       }),
     );
     registrations.push(
+      await ctx.session.hook("model.request", async (event) => {
+        if (!(await activeGateway())) return;
+        // The provider prefix is stripped from the upstream model ID. Supply
+        // the original identity before OpenCode serializes the native request,
+        // including when static provider config already points at the gateway.
+        event.headers["x-lore-provider"] = event.model.providerID;
+      }),
+    );
+    registrations.push(
       await ctx.session.hook("http.request", async (event) => {
         // Probe before every rewrite: a failed gateway never turns into a
         // blanket provider route that prevents normal host-agent use.
-        if (!gatewayBase || !(await probeGateway(gatewayBase))) return;
         await prepareRequest(ctx, event);
       }),
     );
