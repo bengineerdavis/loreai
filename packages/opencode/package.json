@@ -18,7 +18,13 @@
     "build": "echo '@loreai/opencode ships raw TS — no build step needed'"
   },
   "peerDependencies": {
+    "@opencode/plugin": ">=2.2.2 <3",
     "@opencode-ai/plugin": ">=1.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    }
   },
   "dependencies": {
     "@loreai/core": "workspace:*",
@@ -27,6 +33,7 @@
   "devDependencies": {
     "@opencode-ai/plugin": "^1.1.39",
     "@opencode-ai/sdk": "^1.1.39",
+    "@opencode/plugin": "2.2.2",
     "@types/bun": "^1.2.0"
   },
   "files": [
