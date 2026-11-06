@@ -1,7 +1,8 @@
 import { createServer } from "node:http";
-import type { PluginInput } from "@opencode-ai/plugin";
 import { log } from "@loreai/core";
 import { expect, test, vi } from "vitest";
+import { LorePlugin } from "../src/index";
+import { createMockContext } from "./helpers";
 
 const gatewayMock = vi.hoisted(() => ({
   prepareSourceUiAssets: vi.fn(),
@@ -41,20 +42,9 @@ test("redacts sensitive gateway URL components from logger and sink", async () =
   delete process.env.LORE_DISABLED;
 
   try {
-    const { LorePlugin } = await import("../src/index");
-    await LorePlugin({
-      client: {
-        tui: { showToast: () => Promise.resolve() },
-        session: { get: () => Promise.resolve({ data: {} }) },
-      } as unknown as PluginInput["client"],
-      project: {
-        id: "gateway-url-log-redaction",
-      } as unknown as PluginInput["project"],
-      directory: process.cwd(),
-      worktree: process.cwd(),
-      serverUrl: new URL("http://localhost:0"),
-      $: {} as unknown as PluginInput["$"],
-    });
+    const mock = createMockContext({ directory: process.cwd() });
+    const cleanup = await LorePlugin.setup(mock.ctx);
+    if (cleanup) await cleanup();
 
     const logged = infoSpy.mock.calls.flat().join(" ");
     const emitted = sinkMessages.join(" ");

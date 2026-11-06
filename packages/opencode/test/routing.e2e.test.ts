@@ -2,28 +2,33 @@
  * End-to-end test: the OpenCode plugin's REAL active path against a REAL
  * in-process Lore gateway (upstream mocked — no real API call).
  *
- * Unlike the config-hook units (index.test.ts) and per-project header units
- * (session-state.test.ts) — which run with the plugin inert under
- * `NODE_ENV=test` — this test forces the plugin active via
+ * Unlike the editor/transform units (index.test.ts, internal.test.ts) and
+ * per-project header units (session-state.test.ts) — which run with the
+ * plugin inert under `NODE_ENV=test` — this test forces the plugin active via
  * `LORE_OPENCODE_FORCE_ACTIVE=1` and points it at a controlled gateway via
  * `LORE_GATEWAY_URL`, then proves the wiring the whole #1036/#1039 series
  * exists to guard:
  *   1. the plugin DISCOVERS the gateway (gatewayBase is resolved, not ""),
- *      so its `config` hook actually pins provider baseURLs to it,
- *   2. the `chat.headers` hook injects the `x-lore-*` attribution headers, and
- *   3. the process-wide fetch interceptor it installs transparently reroutes a
- *      provider call (`api.anthropic.com`) through the gateway to the upstream.
+ *      so its provider transform actually pins provider baseURLs to it,
+ *   2. the session-domain `model.request` hook injects the `x-lore-*`
+ *      attribution headers, and
+ *   3. the process-wide fetch interceptor it installs transparently reroutes
+ *      a provider call (`api.anthropic.com`) through the gateway to the
+ *      upstream.
  *
- * If discovery or interceptor install regressed, gatewayBase would stay "" and
- * `applyLoreProviderConfig` would no-op (test 1 fails) and `globalThis.fetch`
- * would stay un-patched so the provider call would escape to the real network
- * (test 3 fails) — i.e. these assertions are non-vacuous against the failure
- * mode this series guards.
+ * If discovery or interceptor install regressed, gatewayBase would stay ""
+ * and no provider transform would be registered (test 1 fails) and
+ * `globalThis.fetch` would stay un-patched so the provider call would escape
+ * to the real network (test 3 fails) — i.e. these assertions are non-vacuous
+ * against the failure mode this series guards.
  */
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import type { Hooks, PluginInput } from "@opencode-ai/plugin";
-import { RECALL_TOOL_DESCRIPTION, RECALL_TOOL_NAME } from "@loreai/core";
 import { LorePlugin } from "../src/index";
+import {
+  createMockContext,
+  runModelRequest,
+  type CapturedHook,
+} from "./helpers";
 
 // Capture the pristine fetch BEFORE the plugin installs its interceptor so we
 // can restore it in afterAll. The interceptor patches `globalThis.fetch`
@@ -31,35 +36,6 @@ import { LorePlugin } from "../src/index";
 // worker. (The plugin only installs once per process and never under
 // NODE_ENV=test unless LORE_OPENCODE_FORCE_ACTIVE=1.)
 const originalFetch = globalThis.fetch;
-const assistantProviders = new Map<string, string>();
-const assistantParents = new Map<string, string>();
-
-function createMockClient() {
-  return {
-    tui: { showToast: () => Promise.resolve() },
-    session: {
-      get: () => Promise.resolve({ data: {} }),
-      list: () => Promise.resolve({ data: [] }),
-      create: () => Promise.resolve({ data: { id: "worker_1" } }),
-      messages: () => Promise.resolve({ data: [] }),
-      message: ({ path }: { path: { id: string; messageID: string } }) =>
-        Promise.resolve({
-          data: assistantProviders.has(path.messageID)
-            ? {
-                info: {
-                  id: path.messageID,
-                  sessionID: path.id,
-                  role: "assistant",
-                  providerID: assistantProviders.get(path.messageID),
-                  parentID: assistantParents.get(path.messageID),
-                },
-              }
-            : null,
-        }),
-      prompt: () => Promise.resolve({ data: {} }),
-    },
-  } as unknown as PluginInput["client"];
-}
 
 function cannedAnthropicResponse(text: string): Response {
   return new Response(
@@ -80,7 +56,8 @@ function cannedAnthropicResponse(text: string): Response {
 describe("opencode plugin — e2e routing against a real gateway", () => {
   let baseURL: string;
   let stopServer: () => void;
-  let hooks: Hooks;
+  let providerCallbacks: ((editor: unknown) => void)[] = [];
+  let modelRequestHook: CapturedHook | undefined;
   let upstreamCalls = 0;
   // Snapshot the env vars we mutate so we restore the process exactly.
   const savedEnv: Record<string, string | undefined> = {};
@@ -141,14 +118,17 @@ describe("opencode plugin — e2e routing against a real gateway", () => {
     delete process.env.LORE_REMOTE_URL;
     delete process.env.LORE_DISABLED;
 
-    hooks = await LorePlugin({
-      client: createMockClient(),
-      project: { id: "proj-e2e" } as unknown as PluginInput["project"],
+    const mock = createMockContext({
       directory: process.cwd(),
-      worktree: process.cwd(),
-      serverUrl: new URL("http://localhost:0"),
-      $: {} as unknown as PluginInput["$"],
+      projectID: "proj-e2e",
     });
+    providerCallbacks = mock.providerCallbacks;
+    const teardown = await LorePlugin.setup(mock.ctx);
+    modelRequestHook =
+      mock.sessionHooks.find(
+        (h): h is CapturedHook => h.name === "model.request",
+      ) ?? undefined;
+    await teardown?.();
   });
 
   afterAll(async () => {
@@ -186,208 +166,57 @@ describe("opencode plugin — e2e routing against a real gateway", () => {
     expect(globalThis.fetch).not.toBe(originalFetch);
   });
 
-  test("registers native recall for the discovered local gateway", () => {
-    const recall = hooks.tool?.[RECALL_TOOL_NAME];
-    expect(recall?.description).toBe(RECALL_TOOL_DESCRIPTION);
-    expect(Object.keys(recall?.args ?? {}).sort()).toEqual([
-      "detailLimit",
-      "detailOffset",
-      "id",
-      "ids",
-      "query",
-      "scope",
-    ]);
+  test("the plugin registered a provider transform (discovery resolved a gateway)", () => {
+    // Inert plugins register no provider transform: setup only registers it
+    // when gatewayBase is non-empty. Discovery succeeding is what makes this
+    // array non-empty.
+    expect(providerCallbacks.length).toBeGreaterThan(0);
   });
 
-  test("the plugin's config hook pins provider baseURL to the discovered gateway", async () => {
-    const cfg: Record<string, unknown> = {
-      provider: { anthropic: { options: { apiKey: "x" } } },
+  test("the provider transform pins settings.baseURL to the discovered gateway", () => {
+    // Drive the REAL registered transform (not applyLoreProviderSettings
+    // directly): this only pins a baseURL if the plugin actually resolved
+    // gatewayBase via discovery.
+    const providers: Record<string, { settings?: Record<string, unknown> }> = {
+      anthropic: { settings: { apiKey: "x" } },
     };
-    // Drive the REAL plugin hook (not applyLoreProviderConfig directly): this
-    // only pins a baseURL if the plugin actually resolved gatewayBase via
-    // discovery. An inert plugin (gatewayBase "") would no-op and leave the
-    // user's provider config untouched.
-    await hooks.config?.(cfg);
-    const provider = (
-      cfg.provider as Record<
-        string,
-        { options: { baseURL: string; apiKey: string } }
-      >
-    ).anthropic;
-    expect(provider.options.baseURL).toBe(`${baseURL}/v1`);
-    // Existing user options are preserved through the merge.
-    expect(provider.options.apiKey).toBe("x");
-    // And built-in compaction is disabled by the same hook.
-    expect(cfg.compaction).toEqual({ auto: false, prune: false });
+    for (const cb of providerCallbacks) {
+      cb({
+        list: () =>
+          Object.entries(providers).map(([id, info]) => ({
+            provider: { id, ...info },
+          })),
+        update: (id: string, update: (p: unknown) => void) => {
+          update(providers[id]);
+        },
+      });
+    }
+    const provider = providers.anthropic as {
+      settings: Record<string, unknown>;
+    };
+    expect(provider.settings.baseURL).toBe(`${baseURL}/v1`);
+    // Existing user settings are preserved through the merge.
+    expect(provider.settings.apiKey).toBe("x");
   });
 
-  test("chat.headers injects x-lore attribution headers", async () => {
-    const input = {
+  test("model.request injects x-lore attribution headers", async () => {
+    if (!modelRequestHook)
+      throw new Error("model.request hook was not registered");
+    const headers = await runModelRequest(modelRequestHook, {
       sessionID: "oc-sess-1",
-      agent: "build",
-      model: { providerID: "anthropic", modelID: "claude-3-5-sonnet" },
-      provider: { id: "anthropic" },
-      message: { id: "msg-1" },
-    } as unknown as Parameters<NonNullable<Hooks["chat.headers"]>>[0];
-    // oxlint-disable-next-line typescript/no-unnecessary-type-assertion -- Record cast makes headers indexable for the assertions below
-    const output = { headers: {} as Record<string, string> };
-
-    await hooks["chat.headers"]?.(input, output);
-    expect(output.headers["x-lore-session-id"]).toBe("oc-sess-1");
-    expect(output.headers["x-lore-agent"]).toBe("build");
-    expect(output.headers["x-lore-provider"]).toBe("anthropic");
-  });
-
-  test("registered native recall binds sequential and overlapping token rotations to the verified user turn", async () => {
-    const sessionID = "oc-rotating-turns";
-    const send = async (userID: string, key: string, marker: string) => {
-      const output = {
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": key,
-        } as Record<string, string>,
-      };
-      await hooks["chat.headers"]?.(
-        {
-          sessionID,
-          agent: "build",
-          provider: { id: "anthropic" },
-          model: {},
-          message: { id: userID },
-        } as unknown as Parameters<NonNullable<Hooks["chat.headers"]>>[0],
-        output,
-      );
-      expect(output.headers["x-lore-native-turn-id"]).toBe(userID);
-      const response = await fetch(`${baseURL}/v1/messages`, {
-        method: "POST",
-        headers: output.headers,
-        body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 1024,
-          system: "You are a coding assistant. ".repeat(30),
-          messages: [{ role: "user", content: marker }],
-        }),
-      });
-      expect(response.status).toBe(200);
-      await response.text();
-      assistantProviders.set(`assistant-${userID}`, "anthropic");
-      assistantParents.set(`assistant-${userID}`, userID);
-    };
-    const call = (userID: string) =>
-      hooks.tool![RECALL_TOOL_NAME].execute(
-        { query: "opencode-rotating-turn-memory", scope: "session" },
-        {
-          sessionID,
-          messageID: `assistant-${userID}`,
-          agent: "build",
-          directory: process.cwd(),
-          worktree: process.cwd(),
-          abort: new AbortController().signal,
-          metadata() {},
-          async ask() {},
-        },
-      );
-    await send(
-      "user-1",
-      "oauth-token-1",
-      "opencode-rotating-turn-memory-first",
-    );
-    await send(
-      "user-2",
-      "oauth-token-2",
-      "opencode-rotating-turn-memory-second",
-    );
-    expect(await call("user-1")).toContain(
-      "opencode-rotating-turn-memory-first",
-    );
-    expect(await call("user-2")).toContain(
-      "opencode-rotating-turn-memory-second",
-    );
-    await Promise.all([
-      send("user-3", "oauth-token-3", "opencode-rotating-turn-memory-third"),
-      send("user-4", "oauth-token-4", "opencode-rotating-turn-memory-fourth"),
-    ]);
-    expect(await call("user-3")).toContain(
-      "opencode-rotating-turn-memory-third",
-    );
-    expect(await call("user-4")).toContain(
-      "opencode-rotating-turn-memory-fourth",
-    );
-    expect(await call("user-1")).toContain(
-      "opencode-rotating-turn-memory-first",
-    );
-  });
-
-  test("registered native recall follows the assistant provider across switches and refuses same-provider credential ambiguity", async () => {
-    const sessionID = "oc-provider-switch-session";
-    const send = async (providerID: string, key: string) => {
-      const response = await fetch(`${baseURL}/v1/messages`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": key,
-          "x-lore-session-id": sessionID,
-          "x-lore-agent": "build",
-          "x-lore-provider": providerID,
-          "x-lore-native-turn-id": `turn-${providerID}`,
-          "x-lore-project": process.cwd(),
-        },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 1024,
-          system: "You are a coding assistant. ".repeat(30),
-          messages: [
-            {
-              role: "user",
-              content: `opencode-provider-switch-memory-${providerID}`,
-            },
-          ],
-        }),
-      });
-      expect(response.status).toBe(200);
-      await response.text();
-    };
-    const recall = (providerID: string) => {
-      assistantProviders.set(`message-${providerID}`, providerID);
-      assistantParents.set(`message-${providerID}`, `turn-${providerID}`);
-      return hooks.tool![RECALL_TOOL_NAME].execute(
-        { query: "opencode-provider-switch-memory", scope: "session" },
-        {
-          sessionID,
-          messageID: `message-${providerID}`,
-          agent: "build",
-          directory: process.cwd(),
-          worktree: process.cwd(),
-          abort: new AbortController().signal,
-          metadata() {},
-          async ask() {},
-        },
-      );
-    };
-    await send("anthropic", "switch-key-a");
-    await send("minimax", "switch-key-b");
-    expect(await recall("anthropic")).toContain(
-      "opencode-provider-switch-memory-anthropic",
-    );
-    expect(await recall("minimax")).toContain(
-      "opencode-provider-switch-memory-minimax",
-    );
-    await send("minimax", "another-switch-key-b");
-    expect(await recall("minimax")).toContain("unavailable");
-    expect(await recall("anthropic")).toContain(
-      "opencode-provider-switch-memory-anthropic",
-    );
+    });
+    expect(headers["x-lore-session-id"]).toBe("oc-sess-1");
+    expect(headers["x-lore-agent"]).toBe("build");
+    expect(headers["x-lore-provider"]).toBe("anthropic");
   });
 
   test("the installed interceptor reroutes a provider call through the gateway to the upstream", async () => {
     const before = upstreamCalls;
-    assistantProviders.set("native-message", "anthropic");
-    assistantParents.set("native-message", "native-user");
     // A bare provider call (as the @ai-sdk would make) to a REMOTE host. The
     // interceptor the plugin installed rewrites api.anthropic.com → gateway,
     // which forwards to the mocked upstream. The x-lore-* headers mimic what
-    // chat.headers would have attached on a real turn (the interceptor
-    // preserves all original headers and adds x-lore-upstream-url).
+    // the model.request hook would have attached on a real turn (the
+    // interceptor preserves all original headers and adds x-lore-upstream-url).
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -395,16 +224,14 @@ describe("opencode plugin — e2e routing against a real gateway", () => {
         "x-api-key": "test-key",
         "anthropic-version": "2023-06-01",
         "x-lore-session-id": "oc-sess-1",
-        "x-lore-native-turn-id": "native-user",
         "x-lore-agent": "build",
         "x-lore-provider": "anthropic",
         "x-lore-project": process.cwd(),
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 1024,
-        system: "You are a coding assistant. ".repeat(30),
-        messages: [{ role: "user", content: "opencode-native-session-memory" }],
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hi" }],
       }),
     });
     expect(res.ok).toBe(true);
@@ -415,19 +242,5 @@ describe("opencode plugin — e2e routing against a real gateway", () => {
     // The call to the remote provider host was rerouted to the in-process
     // gateway (not the real network), which hit the mocked upstream.
     expect(upstreamCalls).toBeGreaterThan(before);
-    const recalled = await hooks.tool![RECALL_TOOL_NAME].execute(
-      { query: "opencode-native-session-memory", scope: "session" },
-      {
-        sessionID: "oc-sess-1",
-        messageID: "native-message",
-        agent: "build",
-        directory: process.cwd(),
-        worktree: process.cwd(),
-        abort: new AbortController().signal,
-        metadata() {},
-        async ask() {},
-      },
-    );
-    expect(recalled).toContain("opencode-native-session-memory");
   });
 });

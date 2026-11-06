@@ -17,16 +17,12 @@
     "typecheck": "tsc --noEmit",
     "build": "echo '@loreai/opencode ships raw TS — no build step needed'"
   },
-  "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.1.0"
-  },
   "dependencies": {
     "@loreai/core": "workspace:*",
-    "@loreai/gateway": "workspace:*"
+    "@loreai/gateway": "workspace:*",
+    "@opencode/plugin": "^2.2.5"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.1.39",
-    "@opencode-ai/sdk": "^1.1.39",
     "@types/bun": "^1.2.0"
   },
   "files": [

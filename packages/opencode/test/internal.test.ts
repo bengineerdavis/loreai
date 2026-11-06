@@ -1,15 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { EventEmitter } from "node:events";
-import type { PluginInput } from "@opencode-ai/plugin";
 import { log } from "@loreai/core";
 import {
   gatewayAccessHeadersForRemote,
   installEmbeddedGatewaySigtermHandler,
   isLoopbackUrl,
   prepareLocalUiAssets,
+  reportGatewayUnavailable,
   shouldForwardUpstreamExtraHeader,
-  shouldRegisterNativeRecallTool,
-  surfaceGatewayUnavailable,
 } from "../src/internal";
 
 const gatewayMock = vi.hoisted(() => ({
@@ -164,26 +162,6 @@ describe("remote gateway access headers", () => {
     ).toEqual({});
   });
 
-  test("registers a native recall tool only for local gateway ownership", () => {
-    expect(
-      shouldRegisterNativeRecallTool("http://127.0.0.1:3207", {
-        LORE_REMOTE_URL: "https://lore.example",
-      }),
-    ).toBe(true);
-    expect(
-      shouldRegisterNativeRecallTool("https://lore.example/", {
-        LORE_REMOTE_URL: "https://lore.example",
-      }),
-    ).toBe(false);
-  });
-
-  test("does not register native recall for an unmarked remote gateway", () => {
-    expect(shouldRegisterNativeRecallTool("https://lore.example/", {})).toBe(
-      false,
-    );
-    expect(shouldRegisterNativeRecallTool("", {})).toBe(false);
-  });
-
   test.each([
     "x-api-key",
     "X-Goog-Api-Key",
@@ -199,22 +177,20 @@ describe("remote gateway access headers", () => {
 });
 
 /**
- * `surfaceGatewayUnavailable` is the one user-visible signal left when the
+ * `reportGatewayUnavailable` is the one user-visible signal left when the
  * in-process gateway fails to start. In embedded/TUI mode `log.error` is
  * silenced on stderr (so it can't corrupt the render), which would otherwise
- * make a totally-failed gateway a silent no-op (Daniel's Windows report). The
- * helper raises a TUI-safe toast instead — and must NEVER let a missing,
- * throwing, or rejecting toast turn a degraded session into a crash.
+ * make a totally-failed gateway a silent no-op (Daniel's Windows report).
+ *
+ * v2 note: the pre-2.x helper ALSO raised a TUI-safe toast via the SDK
+ * client (`client.tui.showToast`). The v2 server-plugin context has no
+ * toast/notification channel, so this is log-only now — see the PR's open
+ * questions. The helper must NEVER let a logging failure turn a degraded
+ * session into a crash.
  */
-describe("surfaceGatewayUnavailable", () => {
+describe("reportGatewayUnavailable", () => {
   const MSG = "Lore failed to start — memory features are unavailable.";
   let stderr: ReturnType<typeof vi.spyOn>;
-
-  function clientWith(showToast: (...args: unknown[]) => unknown) {
-    return {
-      tui: { showToast },
-    } as unknown as PluginInput["client"];
-  }
 
   beforeEach(() => {
     stderr = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -227,49 +203,15 @@ describe("surfaceGatewayUnavailable", () => {
     log.silenceStderr(false);
   });
 
-  test("raises a TUI-safe error toast carrying the message", () => {
-    const showToast = vi.fn(() => Promise.resolve());
-    surfaceGatewayUnavailable(clientWith(showToast), MSG);
-
-    expect(showToast).toHaveBeenCalledTimes(1);
-    expect(showToast).toHaveBeenCalledWith({
-      body: { title: "Lore", message: MSG, variant: "error" },
-    });
-  });
-
   test("still records the failure via log.error (file + Sentry sink)", () => {
-    surfaceGatewayUnavailable(
-      clientWith(() => Promise.resolve()),
-      MSG,
-    );
+    reportGatewayUnavailable(MSG);
     const logged = stderr.mock.calls.some((args: unknown[]) =>
       args.join(" ").includes(MSG),
     );
     expect(logged).toBe(true);
   });
 
-  test("swallows a synchronously throwing showToast (no crash)", () => {
-    const showToast = vi.fn(() => {
-      throw new Error("no TUI attached");
-    });
-    expect(() =>
-      surfaceGatewayUnavailable(clientWith(showToast), MSG),
-    ).not.toThrow();
-  });
-
-  test("swallows a rejected toast promise (no unhandled rejection)", async () => {
-    const showToast = vi.fn(() => Promise.reject(new Error("no /tui route")));
-    expect(() =>
-      surfaceGatewayUnavailable(clientWith(showToast), MSG),
-    ).not.toThrow();
-    // Let the swallowed rejection settle — the helper attaches a `.catch`.
-    await Promise.resolve();
-  });
-
-  test("tolerates a client without a TUI toast capability", () => {
-    expect(() =>
-      surfaceGatewayUnavailable({} as unknown as PluginInput["client"], MSG),
-    ).not.toThrow();
-    expect(() => surfaceGatewayUnavailable(undefined, MSG)).not.toThrow();
+  test("never throws (no crash path)", () => {
+    expect(() => reportGatewayUnavailable(MSG)).not.toThrow();
   });
 });

@@ -196,26 +196,28 @@ describe("authenticated native recall", () => {
       client.observeRequestHeaders(new Headers(headers));
       clients.push(client);
     }
+    // v2 adapter shape: the plugin closes over the instance directory, and
+    // execute() resolves to a v2 Tool.Result ({ output: string }).
+    const opencode = createRecallTool({
+      directory: process.cwd(),
+      runner: clients[0].execute,
+    });
     const context = {
       sessionID,
-      messageID: "native-message",
-      agent: "build",
-      directory: process.cwd(),
-      worktree: process.cwd(),
-      abort: new AbortController().signal,
-      metadata() {},
-      async ask() {},
+      signal: new AbortController().signal,
     };
-    const opencode = createRecallTool(clients[0].execute);
-    const preview = await opencode.execute(
-      { query: "detail sentence", scope: "session" },
-      context,
-    );
+    const preview =
+      (
+        await opencode.execute(
+          { query: "detail sentence", scope: "session" },
+          context,
+        )
+      ).output ?? "";
     expect(preview).toContain(markers[0]);
     expect(preview).not.toContain(markers[1]);
     const ref = preview.match(/detail ref: `([^`]+)`/)?.[1];
     expect(ref).toMatch(/^r:/);
-    const detail = await opencode.execute({ id: ref }, context);
+    const detail = (await opencode.execute({ id: ref }, context)).output ?? "";
     expect(detail).toContain(markers[0]);
     expect(detail).not.toContain(markers[1]);
     const pi = createPiRecallTool(
@@ -225,7 +227,7 @@ describe("authenticated native recall", () => {
     const piResult = await pi.execute(
       "call-1",
       { query: "detail sentence", scope: "session" },
-      context.abort,
+      new AbortController().signal,
       undefined,
       {
         sessionManager: {

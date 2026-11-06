@@ -1,94 +1,36 @@
 /**
  * OpenCode session title forwarding (#1921).
  *
- * The harness's own `Session.title` is fetched best-effort from the `chat.headers`
- * hook and forwarded percent-encoded as `x-lore-session-title` so the gateway
- * can persist it as the session's explicit title. OpenCode's auto "New session"
- * placeholder is suppressed and polled until a real title appears; a harness
- * that reports no title is never re-queried.
+ * The harness's own `Session.title` is resolved alongside parentID in the
+ * session-domain `model.request` hook and forwarded percent-encoded as
+ * `x-lore-session-title` so the gateway can persist it as the session's
+ * explicit title. OpenCode's auto "New session" placeholder is suppressed and
+ * polled until a real title appears; a harness that reports no title is never
+ * re-queried.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Hooks, PluginInput } from "@opencode-ai/plugin";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test } from "vitest";
 import { LorePlugin } from "../src/index";
+import { createMockContext, runModelRequest } from "./helpers";
 
-interface MockOpts {
-  parents?: Record<string, string>;
-  /** session id → title session.get should report. Absent ⇒ no title field. */
-  titles?: Record<string, string>;
-  calls?: string[];
-}
-
-function createMockClient(opts: MockOpts): PluginInput["client"] {
-  return {
-    tui: { showToast: () => Promise.resolve() },
-    session: {
-      get: (args: { path: { id: string } }) => {
-        const id = args?.path?.id;
-        opts.calls?.push(id);
-        const parentID = opts.parents?.[id];
-        const title = opts.titles?.[id];
-        return Promise.resolve({
-          data: {
-            id,
-            ...(parentID ? { parentID } : {}),
-            ...(title !== undefined ? { title } : {}),
-          },
-        });
-      },
-      list: () => Promise.resolve({ data: [] }),
-      create: () => Promise.resolve({ data: { id: "worker_1" } }),
-      messages: () => Promise.resolve({ data: [] }),
-      message: () => Promise.resolve({ data: null }),
-      prompt: () => Promise.resolve({ data: {} }),
-    },
-  } as unknown as PluginInput["client"];
-}
-
-async function initPlugin(directory: string, client: PluginInput["client"]) {
-  return LorePlugin({
-    client,
-    project: { id: `proj-${directory}` } as unknown as PluginInput["project"],
-    directory,
-    worktree: directory,
-    serverUrl: new URL("http://localhost:0"),
-    $: {} as unknown as PluginInput["$"],
-  });
-}
-
-type ChatHeadersHook = NonNullable<Hooks["chat.headers"]>;
-type ChatHeadersInput = Parameters<ChatHeadersHook>[0];
-
-function chatInput(sessionID: string): ChatHeadersInput {
-  return {
-    sessionID,
-    agent: "build",
-    model: { providerID: "anthropic", modelID: "claude-3-5-sonnet" },
-    provider: { id: "anthropic" },
-    message: { id: "msg-1" },
-  } as unknown as ChatHeadersInput;
+async function initPlugin(
+  directory: string,
+  options?: Parameters<typeof createMockContext>[0],
+) {
+  const mock = createMockContext({ directory, ...options });
+  const cleanup = await LorePlugin.setup(mock.ctx);
+  const hook = mock.sessionHooks.find((h) => h.name === "model.request");
+  if (!hook) throw new Error("model.request hook was not registered");
+  return { mock, hook, cleanup };
 }
 
 async function headersFor(
-  hooks: Hooks,
+  hook: Parameters<typeof runModelRequest>[0],
   sessionID: string,
 ): Promise<Record<string, string>> {
-  const output = { headers: {} as Record<string, string> };
-  await hooks["chat.headers"]?.(chatInput(sessionID), output);
-  return output.headers;
-}
-
-async function waitForTitle(
-  hooks: Hooks,
-  sessionID: string,
-  expected: string,
-): Promise<void> {
-  await vi.waitFor(async () => {
-    const headers = await headersFor(hooks, sessionID);
-    expect(headers["x-lore-session-title"]).toBe(expected);
-  });
+  return runModelRequest(hook, { sessionID });
 }
 
 describe("OpenCode plugin — session title forwarding (#1921)", () => {
@@ -110,58 +52,71 @@ describe("OpenCode plugin — session title forwarding (#1921)", () => {
   });
 
   test("forwards the session title percent-encoded", async () => {
-    const client = createMockClient({
+    const { hook, mock, cleanup } = await initPlugin(makeTmp("enc"), {
       titles: { s1: "Fix the Ünïcode bug" },
     });
-    const hooks = await initPlugin(makeTmp("enc"), client);
-    const first = await headersFor(hooks, "s1");
-    expect(first["x-lore-session-title"]).toBeUndefined();
-    await waitForTitle(hooks, "s1", "Fix%20the%20%C3%9Cn%C3%AFcode%20bug");
+    try {
+      const headers = await headersFor(hook, "s1");
+      expect(headers["x-lore-session-title"]).toBe(
+        "Fix%20the%20%C3%9Cn%C3%AFcode%20bug",
+      );
+    } finally {
+      if (cleanup) await cleanup();
+      void mock;
+    }
   });
 
   test("placeholder title is not forwarded and is re-queried next turn", async () => {
+    const titles = { ph: "New session - 2026-09-27" };
     const calls: string[] = [];
-    const titles: Record<string, string> = { ph: "New session - 2026-09-27" };
-    const client = createMockClient({ titles, calls });
-    const hooks = await initPlugin(makeTmp("ph"), client);
-
-    const first = await headersFor(hooks, "ph");
-    expect(first["x-lore-session-title"]).toBeUndefined();
-    await vi.waitFor(() => expect(calls).toEqual(["ph"]));
-    // Placeholder is kept but polled: the real title may land any turn.
-    titles.ph = "Investigate FTS tokenizer";
-    const second = await headersFor(hooks, "ph");
-    expect(second["x-lore-session-title"]).toBeUndefined();
-    await waitForTitle(hooks, "ph", "Investigate%20FTS%20tokenizer");
-    expect(calls).toEqual(["ph", "ph"]);
+    const { hook, cleanup } = await initPlugin(makeTmp("ph"), {
+      titles,
+      calls,
+    });
+    try {
+      const first = await headersFor(hook, "ph");
+      expect(first["x-lore-session-title"]).toBeUndefined();
+      // Placeholder is kept but polled: the real title may land any turn.
+      titles.ph = "Investigate FTS tokenizer";
+      const second = await headersFor(hook, "ph");
+      expect(calls).toEqual(["ph", "ph"]);
+      expect(second["x-lore-session-title"]).toBe(
+        "Investigate%20FTS%20tokenizer",
+      );
+    } finally {
+      if (cleanup) await cleanup();
+    }
   });
 
   test("a real title is cached — session.get runs once across turns", async () => {
     const calls: string[] = [];
-    const client = createMockClient({
+    const { hook, cleanup } = await initPlugin(makeTmp("real"), {
       titles: { real: "Refactor the sync outbox" },
       calls,
     });
-    const hooks = await initPlugin(makeTmp("real"), client);
-    const first = await headersFor(hooks, "real");
-    expect(first["x-lore-session-title"]).toBeUndefined();
-    await waitForTitle(hooks, "real", "Refactor%20the%20sync%20outbox");
-    const again = await headersFor(hooks, "real");
-    expect(calls).toEqual(["real"]);
-    expect(again["x-lore-session-title"]).toBe(
-      "Refactor%20the%20sync%20outbox",
-    );
+    try {
+      await headersFor(hook, "real");
+      const again = await headersFor(hook, "real");
+      expect(calls).toEqual(["real"]);
+      expect(again["x-lore-session-title"]).toBe(
+        "Refactor%20the%20sync%20outbox",
+      );
+    } finally {
+      if (cleanup) await cleanup();
+    }
   });
 
   test("a session with no title emits no header and is not re-queried", async () => {
     const calls: string[] = [];
-    const client = createMockClient({ calls });
-    const hooks = await initPlugin(makeTmp("none"), client);
-    const first = await headersFor(hooks, "none");
-    await vi.waitFor(() => expect(calls).toEqual(["none"]));
-    const second = await headersFor(hooks, "none");
-    expect(first["x-lore-session-title"]).toBeUndefined();
-    expect(second["x-lore-session-title"]).toBeUndefined();
-    expect(calls).toEqual(["none"]);
+    const { hook, cleanup } = await initPlugin(makeTmp("none"), { calls });
+    try {
+      const first = await headersFor(hook, "none");
+      const second = await headersFor(hook, "none");
+      expect(first["x-lore-session-title"]).toBeUndefined();
+      expect(second["x-lore-session-title"]).toBeUndefined();
+      expect(calls).toEqual(["none"]);
+    } finally {
+      if (cleanup) await cleanup();
+    }
   });
 });

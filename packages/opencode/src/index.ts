@@ -1,4 +1,4 @@
-import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
+import { Plugin } from "@opencode/plugin";
 import {
   log,
   getGitRemote,
@@ -6,23 +6,23 @@ import {
   installFetchInterceptor,
   RECALL_TOOL_NAME,
   createGatewayRecallClient,
-  NATIVE_RECALL_TURN_HEADER,
 } from "@loreai/core";
 // Helpers live in a separate module so they are NOT re-exported from this
-// plugin entry. OpenCode's legacy plugin loader invokes every function
-// exported from the entry module as a plugin; leaking these helpers pushed
-// `undefined` into the host hooks array and crashed it on event dispatch
-// (`undefined is not an object (evaluating 'A.event')`). See ./internal.ts.
+// plugin entry. (Historical: OpenCode's pre-2.x legacy plugin loader invoked
+// every function export as a plugin; v2's loader instead validates the
+// default export's shape — "Plugin must export a default definition with an
+// id and an effect or setup function". Keeping helpers in ./internal.ts also
+// keeps the entry module minimal for both.
 import {
-  applyLoreProviderConfig,
+  applyLoreProviderSettings,
   gatewayAccessHeadersForRemote,
   installEmbeddedGatewaySigtermHandler,
   isLoopbackUrl,
   prepareLocalUiAssets,
   probeGateway,
-  shouldRegisterNativeRecallTool,
+  reportGatewayUnavailable,
   shouldForwardUpstreamExtraHeader,
-  surfaceGatewayUnavailable,
+  shouldRegisterNativeRecallTool,
 } from "./internal";
 import { createRecallTool } from "./recall-tool";
 
@@ -40,8 +40,20 @@ let nativeRecallClient:
  * provider), and the interceptor redirects them while preserving all
  * original headers. The gateway forwards non-managed headers upstream.
  *
- * Per-request context (session ID, agent name, provider ID) is injected
- * via the `chat.headers` hook.
+ * Per-request context (session ID, agent name, provider ID) is injected via
+ * the session-domain `model.request` hook.
+ *
+ * v2 notes (OpenCode 2.x plugin API):
+ * - `setup` runs once per plugin instance (per location), not once per
+ *   session/project call as the pre-2.x function-shaped plugin did. The
+ *   init flow (gateway probe/start, fetch interceptor install) therefore
+ *   runs here, and per-project state is registered up front for this
+ *   instance's location.
+ * - Hook/transform registrations return `Registration` disposables; the
+ *   cleanup function returned by `setup` disposes them.
+ * - There is no v2 mechanism to disable OpenCode's built-in auto-compaction
+ *   (pre-2.x set `cfg.compaction = { auto: false, prune: false }`); see the
+ *   open questions in the PR description.
  */
 
 /** Default ports to probe when looking for a running gateway (must match gateway defaults). */
@@ -60,8 +72,9 @@ function gatewayOriginForLog(value: string): string {
 /**
  * Resolve the gateway URL by probing known ports and reading the port file.
  *
- * Order: LORE_GATEWAY_URL env var → port file → known default ports (3207, 5673).
- * Returns the URL of a running gateway, or null if none found.
+ * Order: LORE_REMOTE_URL → LORE_GATEWAY_URL env var → port file → known
+ * default ports (3207, 5673). Returns the URL of a running gateway, or null
+ * if none found.
  */
 async function resolveGatewayUrl(): Promise<string | null> {
   // 0. Remote gateway — skip local discovery/startup entirely.
@@ -149,29 +162,21 @@ async function startInProcess(): Promise<string | null> {
 // stale build, etc.) instead of just "Ensure @loreai/gateway is installed."
 let lastGatewayStartError: string | null = null;
 
-// Process-wide initialization state — shared across all sessions.
-// The plugin function is called once per OpenCode session/project, but
-// lore init only needs to run once per process.
+// Process-wide initialization state — shared across all plugin instances
+// (v2 loads the plugin once per location; the interceptor and gateway are
+// process-global and must only be installed once).
 let processInitDone = false;
 let processLoreActive = false;
 let processLoreBase = "";
 
-// Per-project state. The OpenCode plugin function can be called multiple
-// times in the same process (different projects, or after a project switch),
-// so we track each project's path + git remote in a Map keyed by
-// `ctx.project.id`. This prevents the "last project wins" race where a
-// request from project A gets attributed to project B's path because a
-// sub-agent or new project init overwrote the global between turns.
-//
-// `currentProject` is a fallback for the fetch interceptor's `getHeaders()`
-// callback, which doesn't have access to the request's session ID and so
-// can't pick the right Map entry. The chat.headers hook is preferred (it sets
-// the header directly per-request using the right Map entry) — `getHeaders()`
-// only fires when a request bypasses the chat.headers hook.
+// Module-level fallback for the fetch interceptor's `getHeaders()` callback,
+// which has no per-request context. The `model.request` hook is preferred
+// (it sets headers per-request using this instance's project entry);
+// `getHeaders()` only fires when a request bypasses that hook.
 //
 // The path and git remote are stored TOGETHER as a single object so the
 // fallback pair is always self-consistent: a path is never emitted with a
-// remote that was resolved for a DIFFERENT project on an earlier plugin call.
+// remote that was resolved for a DIFFERENT project on an earlier setup.
 // (Pairing a path with a foreign remote is how a non-repo dir acquired
 // another repo's remote and became a "git-remote magnet".)
 let currentProject: { path: string; gitRemote: string } | undefined;
@@ -187,11 +192,8 @@ const projectState = new Map<
  * Each entry is ~200 bytes — even 100 projects would be 20 KB. */
 const SESSION_STATE_TTL_MS = 24 * 60 * 60 * 1000;
 
-/**
- * Drop project entries that haven't been seen in SESSION_STATE_TTL_MS to
- * prevent unbounded growth in long-lived processes. Called opportunistically
- * whenever a new entry is registered.
- */
+/** Drop project entries not seen within SESSION_STATE_TTL_MS (long-lived
+ * processes). Called opportunistically whenever a new entry is registered. */
 function reapStaleProjectState(): void {
   const cutoff = Date.now() - SESSION_STATE_TTL_MS;
   for (const [id, entry] of projectState) {
@@ -200,9 +202,8 @@ function reapStaleProjectState(): void {
 }
 
 /** session.id → { parentID (null = primary session), title, lastSeenAt }.
- *  A session's parent never changes, so the result is cached for the process
- *  lifetime (reaped by the same TTL as projectState) to avoid an SDK round-trip
- *  on every turn. */
+ * A session's parent never changes, so the result is cached for the process
+ * lifetime (TTL-reaped) to avoid an SDK round-trip on every turn. */
 const sessionParent = new Map<
   string,
   {
@@ -212,15 +213,12 @@ const sessionParent = new Map<
     lastSeenAt: number;
   }
 >();
-const sessionInfoLookups = new Map<string, Promise<void>>();
 
 /** OpenCode's default title before it generates a real one. */
 const PLACEHOLDER_TITLE_RE = /^new session\b/i;
 /** Re-check a real (non-placeholder) title at most this often — a session
- *  can be renamed mid-flight, but titles are not worth polling per turn. */
+ * can be renamed mid-flight, but titles are not worth polling per turn. */
 const TITLE_REFETCH_MS = 5 * 60 * 1000;
-/** Bound optional metadata lookups so a hung SDK call cannot suppress retries. */
-const SESSION_INFO_LOOKUP_TIMEOUT_MS = 5_000;
 
 function reapStaleSessionParent(): void {
   const cutoff = Date.now() - SESSION_STATE_TTL_MS;
@@ -243,12 +241,9 @@ function applySessionInfo(
   entry.titleFetchedAt = Date.now();
 }
 
-function sessionInfoKey(directory: string, sessionID: string): string {
-  return JSON.stringify([directory, sessionID]);
-}
-
 /**
- * Resolve a session's parent session ID and harness title via the OpenCode SDK.
+ * Resolve a session's parent session ID and harness title via the v2
+ * session domain (`ctx.session.get({ sessionID })`).
  *
  * OpenCode Task sub-agents run in a child session whose `parentID` points at
  * the session that spawned them; primary sessions have no parent. We forward a
@@ -258,30 +253,27 @@ function sessionInfoKey(directory: string, sessionID: string): string {
  * own `title` is forwarded percent-encoded as `x-lore-session-title` so the
  * gateway can persist it as the session's explicit title (#1921).
  *
- * Cached per workspace and session (parentID is immutable). A successful lookup — including
+ * Cached per session (parentID is immutable). A successful lookup — including
  * the common `null` for a primary session — is cached so we never re-query.
  * Failures (gateway server unreachable, session not yet persisted) are NOT
  * cached and never throw, so a transient error is retried on the next turn
  * rather than permanently latching a real sub-agent as "not a sub-agent".
  */
-function resolveSessionInfo(
-  client: PluginInput["client"],
+async function resolveSessionInfo(
+  session: {
+    get(args: { sessionID: string }): Promise<{
+      parentID?: string;
+      title?: string;
+    }>;
+  },
   sessionID: string,
-  directory: string,
-): {
-  parentID: string | null;
-  title: string | null;
-  parentLookupPending: boolean;
-} {
-  const key = sessionInfoKey(directory, sessionID);
-  const cached = sessionParent.get(key);
+): Promise<{ parentID: string | null; title: string | null }> {
+  const cached = sessionParent.get(sessionID);
   if (cached) {
     cached.lastSeenAt = Date.now();
-    // Title refresh policy (#1921): a harness that reports no title at all
-    // never gets polled again (treat as final); OpenCode's auto "New session"
-    // placeholder IS polled every turn because the real title is generated
-    // shortly after the first turn; a real title refreshes lazily every
-    // TITLE_REFETCH_MS so a manual rename eventually propagates.
+    // Title refresh policy (#1921): no title at all → final; placeholder →
+    // polled every turn (the real title lands shortly after the first
+    // turn); real title → lazy refresh every TITLE_REFETCH_MS.
     const needsRefetch =
       cached.title === null
         ? false
@@ -289,77 +281,36 @@ function resolveSessionInfo(
           ? true
           : Date.now() - cached.titleFetchedAt > TITLE_REFETCH_MS;
     if (!needsRefetch) {
-      return {
-        parentID: cached.parentID,
-        title: cached.title,
-        parentLookupPending: false,
-      };
+      return { parentID: cached.parentID, title: cached.title };
     }
-    fetchSessionInfo(client, sessionID, directory);
-    return {
-      parentID: cached.parentID,
-      title: cached.title,
-      parentLookupPending: false,
-    };
+    try {
+      const res = await session.get({ sessionID });
+      applySessionInfo(cached, res);
+    } catch {
+      // Keep the cached values — a transient failure is not a reason to
+      // drop a title we already know.
+    }
+    return { parentID: cached.parentID, title: cached.title };
   }
-  fetchSessionInfo(client, sessionID, directory);
-  return { parentID: null, title: null, parentLookupPending: true };
+  try {
+    const res = await session.get({ sessionID });
+    const entry = {
+      parentID: null,
+      title: null,
+      titleFetchedAt: 0,
+      lastSeenAt: Date.now(),
+    };
+    applySessionInfo(entry, res);
+    sessionParent.set(sessionID, entry);
+    reapStaleSessionParent();
+    return { parentID: entry.parentID, title: entry.title };
+  } catch {
+    // Best-effort: never break or slow the request path on a lookup failure.
+    return { parentID: null, title: null };
+  }
 }
 
-function fetchSessionInfo(
-  client: PluginInput["client"],
-  sessionID: string,
-  directory: string,
-): void {
-  // Session IDs are scoped by OpenCode's workspace directory; never reuse a
-  // lookup or cached metadata from a different workspace with the same ID.
-  const key = sessionInfoKey(directory, sessionID);
-  if (sessionInfoLookups.has(key)) return;
-
-  // Session metadata is optional: never await it on a provider request. A
-  // failed or timed-out lookup stays uncached so a later turn can retry it.
-  let lookup: Promise<void> | undefined;
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const request = Promise.resolve()
-    .then(() =>
-      client.session.get({
-        path: { id: sessionID },
-        query: { directory },
-      }),
-    )
-    .then((res) => {
-      // A timeout or newer lookup owns the slot now; late responses cannot
-      // overwrite metadata resolved by a later turn.
-      if (!lookup || sessionInfoLookups.get(key) !== lookup) return;
-      // The SDK can return HTTP errors without rejecting. Such a response
-      // cannot establish that the session has no parent and must be retried.
-      if (res.error || !res.data) return;
-      const entry = sessionParent.get(key) ?? {
-        parentID: null,
-        title: null,
-        titleFetchedAt: 0,
-        lastSeenAt: Date.now(),
-      };
-      applySessionInfo(entry, res.data);
-      sessionParent.set(key, entry);
-      reapStaleSessionParent();
-    })
-    .catch(() => {
-      // Metadata failures must not escape into request handling.
-    });
-  const deadline = new Promise<void>((resolve) => {
-    timeout = setTimeout(resolve, SESSION_INFO_LOOKUP_TIMEOUT_MS);
-  });
-  lookup = Promise.race([request, deadline]).finally(() => {
-    if (timeout) clearTimeout(timeout);
-    if (sessionInfoLookups.get(key) === lookup) {
-      sessionInfoLookups.delete(key);
-    }
-  });
-  sessionInfoLookups.set(key, lookup);
-}
-
-/** Memoized lore init promise — ensures concurrent plugin calls don't race. */
+/** Memoized lore init promise — ensures concurrent setup calls don't race. */
 let loreInitPromise: Promise<string | null> | null = null;
 
 /**
@@ -382,312 +333,312 @@ function isInertTestEnv(): boolean {
   );
 }
 
-export const LorePlugin: Plugin = async (ctx) => {
-  // Initialize lore — only probe/start once per process.
-  const loreDisabled =
-    process.env.LORE_DISABLED === "1" || process.env.LORE_DISABLED === "true";
-  let loreActive = processLoreActive;
-  let gatewayBase = processLoreBase;
-  if (!processInitDone) {
-    const inTestEnv = isInertTestEnv();
+const LORE_WORKERS = [
+  {
+    id: "lore-distill",
+    description: "Lore memory distillation worker",
+  },
+  {
+    id: "lore-curator",
+    description: "Lore knowledge curator worker",
+  },
+  {
+    id: "lore-query-expand",
+    description: "Lore query expansion worker",
+  },
+];
 
-    // We're loaded by a real OpenCode process, which owns a full-screen TUI:
-    // any byte on stdout/stderr corrupts the render. Flip the core logger's
-    // process-global silence flag — which the in-process gateway's own (bundled)
-    // copy of `core` reads off `globalThis` too — so NOTHING (not even
-    // `log.error` or gateway warnings) reaches the terminal. Everything still
-    // lands in the log file + Sentry sink (`lore logs`). Skipped under inert
-    // test mode so unrelated suites keep their console.
-    if (!inTestEnv) log.silenceStderr();
+export const LorePlugin = Plugin.define({
+  id: "loreai",
+  async setup(ctx) {
+    // Initialize lore — only probe/start once per process.
+    const loreDisabled =
+      process.env.LORE_DISABLED === "1" || process.env.LORE_DISABLED === "true";
+    let loreActive = processLoreActive;
+    let gatewayBase = processLoreBase;
+    if (!processInitDone) {
+      const inTestEnv = isInertTestEnv();
 
-    if (!loreDisabled && !inTestEnv) {
-      // Memoize so concurrent LorePlugin calls don't race on probe→spawn.
-      if (!loreInitPromise) {
-        loreInitPromise = (async () => {
-          // Try to find a running gateway first (probes port file + known ports).
-          const existingUrl = await resolveGatewayUrl();
-          if (existingUrl) {
-            log.info(`gateway detected at ${gatewayOriginForLog(existingUrl)}`);
-            return existingUrl;
-          }
-          // No running gateway — start one in-process (handles fallback chain).
-          log.info("starting gateway in-process…");
-          const startedUrl = await startInProcess();
-          if (startedUrl) {
-            log.info(
-              `gateway started in-process at ${gatewayOriginForLog(startedUrl)}`,
-            );
-            return startedUrl;
-          }
-          return null;
-        })();
+      // We're loaded by a real OpenCode process, which owns a full-screen TUI:
+      // any byte on stdout/stderr corrupts the render. Flip the core logger's
+      // process-global silence flag — which the in-process gateway's own
+      // (bundled) copy of `core` reads off `globalThis` too — so NOTHING (not
+      // even `log.error` or gateway warnings) reaches the terminal. Everything
+      // still lands in the log file + Sentry sink (`lore logs`). Skipped under
+      // inert test mode so unrelated suites keep their console.
+      if (!inTestEnv) log.silenceStderr();
+
+      if (!loreDisabled && !inTestEnv) {
+        // Memoize so concurrent setup calls don't race on probe→spawn.
+        if (!loreInitPromise) {
+          loreInitPromise = (async () => {
+            // Try to find a running gateway first (probes port file + ports).
+            const existingUrl = await resolveGatewayUrl();
+            if (existingUrl) {
+              log.info(
+                `gateway detected at ${gatewayOriginForLog(existingUrl)}`,
+              );
+              return existingUrl;
+            }
+            // No running gateway — start one in-process (fallback chain).
+            log.info("starting gateway in-process…");
+            const startedUrl = await startInProcess();
+            if (startedUrl) {
+              log.info(`gateway started in-process at ${startedUrl}`);
+              return startedUrl;
+            }
+            return null;
+          })();
+        }
+        const result = await loreInitPromise;
+        if (result) {
+          loreActive = true;
+          gatewayBase = result;
+        }
       }
-      const result = await loreInitPromise;
-      if (result) {
-        loreActive = true;
-        gatewayBase = result;
+      processLoreActive = loreActive;
+      processLoreBase = gatewayBase;
+    }
+
+    if (!loreActive && !loreDisabled) {
+      const inTestEnv = isInertTestEnv();
+      if (!inTestEnv) {
+        const base = "Lore failed to start — memory features are unavailable.";
+        const msg = lastGatewayStartError
+          ? `${base} Gateway error: ${lastGatewayStartError}` +
+            (/not found|not exported|cannot find module/i.test(
+              lastGatewayStartError,
+            )
+              ? " — this looks like a stale build; rebuild with" +
+                " `pnpm --filter @loreai/gateway run bundle`" +
+                " (or `run build` for a dev checkout)."
+              : "")
+          : `${base} Ensure @loreai/gateway is installed.`;
+        // v2 note: the pre-2.x plugin also raised a TUI-safe toast via the
+        // SDK client (`ctx.client.tui.showToast`) so a totally-failed gateway
+        // wasn't a silent no-op (Daniel's Windows report). The v2 server
+        // plugin context has no toast/notification channel, so this is
+        // log-only now — see the PR's open questions.
+        reportGatewayUnavailable(msg);
       }
     }
-    processLoreActive = loreActive;
-    processLoreBase = gatewayBase;
-  }
 
-  if (!loreActive && !loreDisabled) {
-    const inTestEnv = isInertTestEnv();
-    if (!inTestEnv) {
-      const base = "Lore failed to start — memory features are unavailable.";
-      const msg = lastGatewayStartError
-        ? `${base} Gateway error: ${lastGatewayStartError}` +
-          (/not found|not exported|cannot find module/i.test(
-            lastGatewayStartError,
-          )
-            ? " — this looks like a stale build; rebuild with" +
-              " `pnpm --filter @loreai/gateway run bundle`" +
-              " (or `run build` for a dev checkout)."
-            : "")
-        : `${base} Ensure @loreai/gateway is installed.`;
-      // `log.error` is silenced on stderr in embedded/TUI mode, so it alone is
-      // invisible to a user in the OpenCode TUI. Also raise a TUI-safe toast so
-      // a totally-failed gateway isn't a silent no-op (Daniel's Windows report).
-      surfaceGatewayUnavailable(ctx.client, msg);
-    }
-  }
+    // Compute and register THIS location's project state. The Map is keyed
+    // by project id so concurrent projects in the same process (e.g.,
+    // worktrees opened in parallel) don't clobber each other. v2's setup
+    // runs once per plugin instance, so the project path is computed here
+    // instead of on every pre-2.x plugin call.
+    const projectID = ctx.location.project?.id ?? ctx.location.directory;
+    const thisProjectPath = discoverWorkspaceRoot(ctx.location.directory);
 
-  // Compute and register THIS project's state. The Map is keyed by
-  // `ctx.project.id` so concurrent projects in the same process (e.g.,
-  // worktrees opened in parallel) don't clobber each other.
-  const thisProjectPath = discoverWorkspaceRoot(ctx.worktree || ctx.directory);
+    // Resolve git remote per-project. Re-use the cached value when the same
+    // project is seen again (avoids spawning `git remote -v` every setup).
+    const existingState = projectState.get(projectID);
+    const thisGitRemote =
+      existingState?.projectPath === thisProjectPath
+        ? existingState.gitRemote
+        : (getGitRemote(thisProjectPath) ?? "");
 
-  // Resolve git remote per-project. Re-use the cached value when the same
-  // project is seen again (avoids spawning `git remote -v` every turn).
-  const existingState = projectState.get(ctx.project.id);
-  const thisGitRemote =
-    existingState?.projectPath === thisProjectPath
-      ? existingState.gitRemote
-      : (getGitRemote(thisProjectPath) ?? "");
+    projectState.set(projectID, {
+      projectPath: thisProjectPath,
+      gitRemote: thisGitRemote,
+      lastSeenAt: Date.now(),
+    });
+    reapStaleProjectState();
 
-  projectState.set(ctx.project.id, {
-    projectPath: thisProjectPath,
-    gitRemote: thisGitRemote,
-    lastSeenAt: Date.now(),
-  });
-  reapStaleProjectState();
+    // Module-level fallback (used only when model.request is bypassed).
+    currentProject = { path: thisProjectPath, gitRemote: thisGitRemote };
 
-  // Module-level fallback (used only when chat.headers is bypassed).
-  // Updated on every plugin call so the most-recently-active project wins
-  // for fetches that arrive without a known session ID (e.g., direct
-  // SDK fetches that skip the plugin's chat.headers hook).
-  currentProject = { path: thisProjectPath, gitRemote: thisGitRemote };
+    try {
+      const registrations: { dispose: () => Promise<void> }[] = [];
 
-  try {
-    const hooks: Hooks = {
-      // Disable built-in compaction (gateway handles it), register hidden
-      // worker agents, and redirect all provider baseURLs through the gateway.
-      config: async (input) => {
-        const cfg = input as Record<string, unknown>;
-        cfg.compaction = { auto: false, prune: false };
-        // `mode: "subagent"` is REQUIRED for `hidden` to take effect: OpenCode
-        // defaults agents to `mode: "all"` (visible in BOTH the primary Tab
-        // picker and the @-mention/skill list) and only honors `hidden: true`
-        // for subagent-mode agents. Without it these internal workers leak into
-        // every host project's agent/skill picker.
-        cfg.agent = {
-          ...(cfg.agent as Record<string, unknown> | undefined),
-          "lore-distill": {
-            mode: "subagent",
-            hidden: true,
-            description: "Lore memory distillation worker",
-          },
-          "lore-curator": {
-            mode: "subagent",
-            hidden: true,
-            description: "Lore knowledge curator worker",
-          },
-          "lore-query-expand": {
-            mode: "subagent",
-            hidden: true,
-            description: "Lore query expansion worker",
-          },
-        };
-        // Pin the Anthropic provider's baseURL to the gateway. See
-        // applyLoreProviderConfig in ./internal.ts for the full rationale.
-        applyLoreProviderConfig(cfg, gatewayBase);
-      },
+      // Disable built-in compaction? — NOT POSSIBLE in v2 (see PR open
+      // questions): pre-2.x set `cfg.compaction = { auto: false, prune: false }`
+      // because the gateway handles compaction; v2 exposes no plugin path to
+      // disable auto-compaction.
 
-      tool:
-        loreDisabled || !shouldRegisterNativeRecallTool(gatewayBase)
-          ? {}
-          : {
-              [RECALL_TOOL_NAME]: createRecallTool(
-                (input, context) =>
-                  nativeRecallClient
-                    ? nativeRecallClient.execute(input, context)
+      // Register the hidden worker agents via the agent domain transform.
+      // `mode: "subagent"` is REQUIRED for `hidden` to take effect: OpenCode
+      // defaults agents to `mode: "all"` (visible in BOTH the primary Tab
+      // picker and the @-mention/skill list) and only honors `hidden: true`
+      // for subagent-mode agents. Without it these internal workers leak into
+      // every host project's agent/skill picker.
+      //
+      // KNOWN GAP (see PR open questions): the v2 AgentEditor has no `add()`,
+      // only update-by-id. Agents that already exist are updated in place;
+      // missing ones are logged and skipped rather than crashing setup —
+      // upstream needs an agent-creation path for full parity.
+      registrations.push(
+        await ctx.agent.transform((editor) => {
+          for (const worker of LORE_WORKERS) {
+            const existing = editor.get(worker.id);
+            if (existing) {
+              editor.update(worker.id, (agent) => {
+                agent.mode = "subagent";
+                agent.hidden = true;
+                agent.description = worker.description;
+              });
+            } else {
+              log.warn(
+                `agent ${worker.id} does not exist yet — v2 has no agent-creation path; skipping`,
+              );
+            }
+          }
+        }),
+      );
+
+      // Pin every provider's baseURL to the gateway via the provider domain
+      // transform. See applyLoreProviderSettings in ./internal.ts for the full
+      // rationale (the /messages-vs-/v1/messages 404 and the resolveSDK()
+      // env-var bypass). `settings.baseURL` is v2's home for what pre-2.x
+      // called `options.baseURL`.
+      if (gatewayBase) {
+        registrations.push(
+          await ctx.provider.transform((editor) => {
+            applyLoreProviderSettings(editor, gatewayBase);
+          }),
+        );
+      }
+
+      // Register the native recall tool (#2065) via the v2 tool domain.
+      // Unlike AgentEditor, ToolEditor HAS an add() — the tool can be
+      // registered in v2 exactly as upstream intended.
+      if (shouldRegisterNativeRecallTool(gatewayBase) && !nativeRecallClient) {
+        nativeRecallClient = createGatewayRecallClient(gatewayBase);
+      }
+      if (nativeRecallClient) {
+        const client = nativeRecallClient;
+        registrations.push(
+          await ctx.tool.transform((editor) => {
+            if (editor.get(RECALL_TOOL_NAME)) return;
+            editor.add(
+              createRecallTool({
+                directory: ctx.location.directory,
+                runner: (input, context) =>
+                  client
+                    ? client.execute(input, context)
                     : Promise.resolve(
                         "Recall is unavailable for this authenticated session.",
                       ),
-                ctx.client,
-              ),
-            },
+              }),
+            );
+          }),
+        );
+      }
 
       // Inject per-request identifiers so the gateway can distinguish meta
       // requests (title generation, summary agents, etc.) from real
       // conversation turns and route by provider.
       // Project path, git remote, and upstream URL are injected by the
       // fetch interceptor (installed once per process).
-      "chat.headers": async (input, output) => {
-        Object.assign(
-          output.headers,
-          gatewayAccessHeadersForRemote(gatewayBase),
-        );
-        // Inject stable session ID — OpenCode's DB session ID survives restarts,
-        // unlike x-session-affinity (nanoid regenerated per process).
-        output.headers["x-lore-session-id"] = input.sessionID;
-        output.headers[NATIVE_RECALL_TURN_HEADER] = input.message.id;
-        output.headers["x-lore-agent"] = input.agent;
-        // Flag OpenCode Task sub-agents so the gateway sizes their LTM
-        // injection (see #1300). A sub-agent runs in a child session carrying a
-        // parentID; forward it as the `x-parent-session-id` signal the gateway
-        // already understands (Claude Code sends this natively). Resolution is
-        // cached and never blocks or throws on failure.
-        const sessionInfo = resolveSessionInfo(
-          ctx.client,
-          input.sessionID,
-          ctx.worktree || ctx.directory,
-        );
-        if (sessionInfo.parentID) {
-          output.headers["x-parent-session-id"] = sessionInfo.parentID;
-        } else {
-          // The initial lookup is intentionally fire-and-forget. Tell the
-          // gateway to apply the conservative sub-agent budget until it can
-          // classify a root session and clear that temporary state.
-          output.headers["x-lore-session-parent-state"] =
-            sessionInfo.parentLookupPending ? "pending" : "primary";
-        }
-        // Forward the harness's own session title so the gateway can persist
-        // it as the session's explicit title (#1921). Percent-encoded — header
-        // values must be ASCII. Placeholder titles are suppressed here too
-        // (the gateway would drop them anyway).
-        if (
-          sessionInfo.title &&
-          !PLACEHOLDER_TITLE_RE.test(sessionInfo.title)
-        ) {
-          output.headers["x-lore-session-title"] = encodeURIComponent(
-            sessionInfo.title,
+      registrations.push(
+        await ctx.session.hook("model.request", async (input) => {
+          Object.assign(
+            input.headers,
+            gatewayAccessHeadersForRemote(gatewayBase),
           );
-        }
-        // Inject project path + git remote for THIS request based on the
-        // current plugin's project. Setting it here (rather than relying on
-        // the fetch interceptor's getHeaders() global) ensures that
-        // concurrent sub-agents or sibling projects in the same OpenCode
-        // process don't have their paths clobbered. The fetch interceptor
-        // still sets a fallback via getHeaders() for requests that bypass
-        // this hook (e.g., embedding/image generation).
-        if (thisProjectPath) {
-          output.headers["x-lore-project"] = thisProjectPath;
-        }
-        if (thisGitRemote) {
-          output.headers["x-lore-git-remote"] = thisGitRemote;
-        }
-        // Inject provider ID so the gateway uses provider-based routing
-        // (correct protocol + upstream URL) instead of model-prefix guessing.
-        // OpenCode's plugin SDK types don't expose `.id` on the provider
-        // object, but it IS present at runtime. Cast around incomplete typedef.
-        const providerID = (
-          input.provider as Record<string, unknown> | undefined
-        )?.id as string | undefined;
-        if (providerID) {
-          output.headers["x-lore-provider"] = providerID;
-        }
-        // For local/self-hosted providers (vllm, ollama, llamacpp, etc.),
-        // forward LORE_UPSTREAM_<PROVIDER> as the x-lore-upstream-url header
-        // so the gateway can route the request to the user's local server.
-        // Convention matches the Pi plugin's registerProviders() block.
-        if (providerID) {
-          const envKey = `LORE_UPSTREAM_${providerID.toUpperCase().replace(/-/g, "_")}`;
-          const upstream = process.env[envKey];
-          if (upstream && !output.headers["x-lore-upstream-url"]) {
-            output.headers["x-lore-upstream-url"] = upstream;
+          input.headers["x-lore-session-id"] = input.sessionID;
+          input.headers["x-lore-agent"] = input.agent;
+          const sessionInfo = await resolveSessionInfo(
+            ctx.session,
+            input.sessionID,
+          );
+          if (sessionInfo.parentID) {
+            input.headers["x-parent-session-id"] = sessionInfo.parentID;
           }
-        }
-        // Forward LORE_UPSTREAM_EXTRA_HEADERS values as literal headers so
-        // corporate proxies / LiteLLM / Cloudflare AI Gateway get the
-        // required auth/team-routing tokens on every call. The gateway
-        // applies the same env var on its side as a safety net (so the
-        // headers are present even when the plugin is bypassed).
-        const extrasRaw = process.env.LORE_UPSTREAM_EXTRA_HEADERS;
-        if (extrasRaw) {
-          for (const rawLine of extrasRaw.split(/\r?\n/)) {
-            const line = rawLine.trim();
-            if (!line) continue;
-            const colonIdx = line.indexOf(":");
-            if (colonIdx <= 0) continue;
-            const name = line.slice(0, colonIdx).trim();
-            const value = line.slice(colonIdx + 1).trim();
-            if (name) {
-              // Don't clobber headers the gateway already manages.
-              if (shouldForwardUpstreamExtraHeader(name)) {
-                output.headers[name] = value;
+          if (
+            sessionInfo.title &&
+            !PLACEHOLDER_TITLE_RE.test(sessionInfo.title)
+          ) {
+            input.headers["x-lore-session-title"] = encodeURIComponent(
+              sessionInfo.title,
+            );
+          }
+          if (thisProjectPath) {
+            input.headers["x-lore-project"] = thisProjectPath;
+          }
+          if (thisGitRemote) {
+            input.headers["x-lore-git-remote"] = thisGitRemote;
+          }
+          const providerID = input.model.providerID;
+          if (providerID) {
+            input.headers["x-lore-provider"] = providerID;
+            const envKey = `LORE_UPSTREAM_${providerID.toUpperCase().replace(/-/g, "_")}`;
+            const upstream = process.env[envKey];
+            if (upstream && !input.headers["x-lore-upstream-url"]) {
+              input.headers["x-lore-upstream-url"] = upstream;
+            }
+          }
+          const extrasRaw = process.env.LORE_UPSTREAM_EXTRA_HEADERS;
+          if (extrasRaw) {
+            for (const rawLine of extrasRaw.split(/\r?\n/)) {
+              const line = rawLine.trim();
+              if (!line) continue;
+              const colonIdx = line.indexOf(":");
+              if (colonIdx <= 0) continue;
+              const name = line.slice(0, colonIdx).trim();
+              const value = line.slice(colonIdx + 1).trim();
+              if (name && shouldForwardUpstreamExtraHeader(name)) {
+                input.headers[name] = value;
               }
             }
           }
+        }),
+      );
+
+      // Startup banner + one-per-process interceptor install. Routed through
+      // `log` (file + sink, stderr only when not silenced) — NEVER a raw
+      // stderr write: OpenCode owns a full-screen TUI and any stray byte
+      // corrupts it. Visible via `lore logs`.
+      if (!processInitDone) {
+        log.info(`active: ${thisProjectPath}`);
+
+        if (loreActive) {
+          installFetchInterceptor({
+            gatewayBase,
+            getHeaders: () => {
+              const headers: Record<string, string> = {
+                ...gatewayAccessHeadersForRemote(gatewayBase),
+              };
+              const cur = currentProject;
+              if (cur?.path) {
+                headers["x-lore-project"] = cur.path;
+                if (cur.gitRemote) headers["x-lore-git-remote"] = cur.gitRemote;
+              }
+              return headers;
+            },
+          });
+          log.info(`routing through ${gatewayOriginForLog(gatewayBase)}`);
+          log.info(`dashboard: ${gatewayOriginForLog(gatewayBase)}/ui`);
         }
-      },
-    };
 
-    // Startup banner. Routed through `log` (file + sink, stderr only when not
-    // silenced) — NEVER a raw stderr write: OpenCode owns a full-screen TUI and
-    // any stray byte corrupts it. Visible via `lore logs`.
-    if (!processInitDone) {
-      const projectPath = discoverWorkspaceRoot(ctx.worktree || ctx.directory);
-      log.info(`active: ${projectPath}`);
-
-      if (loreActive) {
-        nativeRecallClient = createGatewayRecallClient(gatewayBase);
-        // Install the fetch interceptor once per process. It transparently
-        // reroutes outgoing LLM API calls through the gateway while
-        // preserving original auth headers and URLs.
-        installFetchInterceptor({
-          gatewayBase,
-          onRequestHeaders: (headers) =>
-            nativeRecallClient?.observeRequestHeaders(headers),
-          getHeaders: () => {
-            const headers: Record<string, string> = {
-              ...gatewayAccessHeadersForRemote(gatewayBase),
-            };
-            const cur = currentProject;
-            if (cur?.path) {
-              headers["x-lore-project"] = cur.path;
-              // Only emit the remote paired with the path it was resolved FOR,
-              // never a remote left over from a different project's plugin call.
-              if (cur.gitRemote) headers["x-lore-git-remote"] = cur.gitRemote;
-            }
-            return headers;
-          },
-        });
-        const gatewayLogOrigin = gatewayOriginForLog(gatewayBase);
-        log.info(`routing through ${gatewayLogOrigin}`);
-        log.info(`dashboard available at ${gatewayLogOrigin}/ui`);
+        processInitDone = true;
       }
 
-      processInitDone = true;
+      // v2 cleanup: dispose hook/transform registrations when the plugin
+      // unloads. The gateway and fetch interceptor stay process-global —
+      // tearing them down on one instance's unload would break every other
+      // instance in the same process.
+      return async () => {
+        for (const registration of registrations) {
+          try {
+            await registration.dispose();
+          } catch (e) {
+            const detail = e instanceof Error ? e.message : String(e);
+            log.warn(`cleanup of a lore registration failed: ${detail}`);
+          }
+        }
+      };
+    } catch (e) {
+      // Log the full error before re-throwing so OpenCode's plugin loader
+      // (which catches and swallows the error) doesn't hide the root cause.
+      // `log.error` captures it to the file + Sentry sink even when stderr is
+      // silenced for the TUI, so the cause survives in `lore logs`.
+      const detail = e instanceof Error ? e.stack || e.message : String(e);
+      log.error(`init failed: ${detail}`);
+      throw e;
     }
+  },
+});
 
-    return hooks;
-  } catch (e) {
-    // Log the full error before re-throwing so OpenCode's plugin loader
-    // (which catches and swallows the error) doesn't hide the root cause.
-    // `log.error` captures it to the file + Sentry sink even when stderr is
-    // silenced for the TUI, so the cause survives in `lore logs`.
-    const detail = e instanceof Error ? e.stack || e.message : String(e);
-    log.error(`init failed: ${detail}`);
-    throw e;
-  }
-};
-
-// WARNING: do NOT add any other export to this module. OpenCode's legacy
-// plugin loader invokes every FUNCTION export as a plugin (pushing its return
-// value into the host hooks array) and THROWS on any non-function export,
-// dropping the plugin entirely. Keep helpers in ./internal.ts. This module
-// must export only LorePlugin + this same-reference default. Guarded by the
-// "plugin entry module export shape" test in test/index.test.ts.
 export default LorePlugin;

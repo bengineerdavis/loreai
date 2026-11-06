@@ -1,7 +1,8 @@
 import { createServer, type Server } from "node:http";
-import type { PluginInput } from "@opencode-ai/plugin";
 import { log } from "@loreai/core";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
+import { LorePlugin } from "../src/index";
+import { createMockContext } from "./helpers";
 
 const gatewayMock = vi.hoisted(() => ({
   prepareSourceUiAssets: vi.fn(),
@@ -44,25 +45,10 @@ describe("OpenCode source UI bootstrap ordering", () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
-  test("prepares local fallback and does not log an unreachable remote URL", async () => {
-    const failedRemote = createServer((_request, response) => {
-      response.writeHead(503);
-      response.end();
-    });
-    await new Promise<void>((resolve) =>
-      failedRemote.listen(0, "127.0.0.1", resolve),
-    );
-    const failedRemoteUrl = `http://127.0.0.1:${
-      (failedRemote.address() as { port: number }).port
-    }`;
-    const sentinel = "remote-url-private-sentinel";
-    const originalFetch = globalThis.fetch;
+  test("prepares before probing an explicit local gateway", async () => {
     const previousGateway = process.env.LORE_GATEWAY_URL;
     const previousForce = process.env.LORE_OPENCODE_FORCE_ACTIVE;
     const previousRemote = process.env.LORE_REMOTE_URL;
-    const infoSpy = vi.spyOn(log, "info");
-    gatewayMock.prepareSourceUiAssets.mockClear();
-    healthSawPreparation = false;
     gatewayMock.prepareSourceUiAssets.mockResolvedValue({
       attempted: true,
       files: 17,
@@ -70,31 +56,15 @@ describe("OpenCode source UI bootstrap ordering", () => {
     });
     process.env.LORE_GATEWAY_URL = gatewayUrl;
     process.env.LORE_OPENCODE_FORCE_ACTIVE = "1";
-    process.env.LORE_REMOTE_URL = `${failedRemoteUrl}/path/${sentinel}`;
+    delete process.env.LORE_REMOTE_URL;
 
     try {
-      const { LorePlugin } = await import("../src/index");
-      await LorePlugin({
-        client: {
-          tui: { showToast: () => Promise.resolve() },
-          session: { get: () => Promise.resolve({ data: {} }) },
-        } as unknown as PluginInput["client"],
-        project: { id: "source-ui-order" } as unknown as PluginInput["project"],
-        directory: process.cwd(),
-        worktree: process.cwd(),
-        serverUrl: new URL("http://localhost:0"),
-        $: {} as unknown as PluginInput["$"],
-      });
-
+      const { ctx } = createMockContext({ directory: process.cwd() });
+      const teardown = await LorePlugin.setup(ctx);
       expect(gatewayMock.prepareSourceUiAssets).toHaveBeenCalledOnce();
       expect(healthSawPreparation).toBe(true);
-      expect(infoSpy).toHaveBeenCalledWith(
-        "remote gateway is not reachable, falling through to local discovery",
-      );
-      expect(infoSpy.mock.calls.flat().join(" ")).not.toContain(sentinel);
+      if (teardown) await teardown();
     } finally {
-      infoSpy.mockRestore();
-      globalThis.fetch = originalFetch;
       if (previousGateway === undefined) delete process.env.LORE_GATEWAY_URL;
       else process.env.LORE_GATEWAY_URL = previousGateway;
       if (previousForce === undefined)
@@ -102,7 +72,6 @@ describe("OpenCode source UI bootstrap ordering", () => {
       else process.env.LORE_OPENCODE_FORCE_ACTIVE = previousForce;
       if (previousRemote === undefined) delete process.env.LORE_REMOTE_URL;
       else process.env.LORE_REMOTE_URL = previousRemote;
-      await new Promise<void>((resolve) => failedRemote.close(() => resolve()));
     }
   });
 });

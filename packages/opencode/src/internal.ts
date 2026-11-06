@@ -2,19 +2,19 @@
  * Internal helpers for the Lore OpenCode plugin.
  *
  * These functions are intentionally kept OUT of the plugin entry module
- * (`./index.ts`). OpenCode's legacy plugin loader treats EVERY function
- * exported from a plugin module as a plugin instance and invokes it (see
- * `getServerPlugin`/`getLegacyPlugins` in opencode's plugin loader). Exporting
- * these helpers from the entry module caused them to be invoked as plugins and
- * their return values pushed into the host's hooks array:
- * `applyLoreProviderConfig` returns `undefined`, so the host crashed on the
- * first hook dispatch with `undefined is not an object (evaluating 'A.event')`
- * (the `?.` guards the `.event` property, not the `undefined` hook element).
- *  Keeping them in a separate module means the entry module exposes only the
- *  plugin function itself, while tests can still import them here.
+ * (`./index.ts`). Historically, OpenCode's pre-2.x legacy plugin loader
+ * treated EVERY function exported from a plugin module as a plugin instance
+ * and invoked it (see `getServerPlugin`/`getLegacyPlugins` in opencode's
+ * plugin loader): exporting these helpers from the entry module caused them
+ * to be invoked as plugins and their return values pushed into the host's
+ * hooks array — `applyLoreProviderConfig` returned `undefined`, so the host
+ * crashed on the first hook dispatch with `undefined is not an object
+ * (evaluating 'A.event')`. Keeping them in a separate module means the entry
+ * module exposes only the plugin itself, while tests can still import them
+ * here. v2's loader validates the default export's shape instead, but a
+ * minimal entry module stays the safe posture under either loader.
  */
 
-import type { PluginInput } from "@opencode-ai/plugin";
 import { GATEWAY_AUTH_HEADER, isRemoteGatewayTarget, log } from "@loreai/core";
 import * as http from "node:http";
 import * as https from "node:https";
@@ -28,7 +28,7 @@ export interface SigtermHost {
 /**
  * Bridge the host process' SIGTERM to an embedded gateway's bounded shutdown.
  *
- * OpenCode's plugin `dispose` hook follows its per-workspace instance cache and
+ * OpenCode's plugin cleanup follows its per-workspace instance cache and
  * can run during ordinary reloads, so it cannot own a process-wide gateway.
  * Its headless `serve` command also does not dispose that cache on SIGTERM.
  * Start Lore teardown first, then explicitly finish the requested process exit.
@@ -85,19 +85,11 @@ export function gatewayAccessHeadersForRemote(
   gatewayBase: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
+  const remoteUrl = env.LORE_REMOTE_URL?.replace(/\/+$/, "");
   const token = env.LORE_GATEWAY_AUTH_TOKEN;
-  return isRemoteGatewayTarget(gatewayBase, env) && token
+  return remoteUrl === gatewayBase.replace(/\/+$/, "") && token
     ? { [GATEWAY_AUTH_HEADER]: token }
     : {};
-}
-
-export function shouldRegisterNativeRecallTool(
-  gatewayBase: string,
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  // Native recall reads the host's local database. Keep it available only
-  // when model traffic goes to a local gateway, never a remote target.
-  return isLoopbackUrl(gatewayBase) && !isRemoteGatewayTarget(gatewayBase, env);
 }
 
 /** Provider and Lore credentials are applied by the gateway, never this hop. */
@@ -129,61 +121,80 @@ function probeLoopback(url: string, signal: AbortSignal): Promise<boolean> {
 }
 
 /**
- * Pin every opencode provider's `options.baseURL` to the Lore gateway.
+ * The slice of the v2 provider editor this helper uses, declared structurally
+ * so unit tests can pass a plain fake and the real SDK editor assigns without
+ * casts (`never` in the callback position is assignable from any concrete
+ * parameter type).
+ */
+export interface LoreProviderEditorLike {
+  list(): readonly { provider: { id: string } }[];
+  update(
+    providerID: string,
+    update: (provider: unknown) => void,
+  ): void | Promise<void>;
+}
+
+/**
+ * Pin every discovered provider's `settings.baseURL` to the Lore gateway.
  * Without this, opencode can derive the Anthropic baseURL from
  * `OPENAI_BASE_URL` (stripping `/v1`), sending the SDK to
  * `http://host/messages` (no /v1) — the gateway only routes `/v1/messages`,
  * and the fetch interceptor skips 127.0.0.1 to avoid loops, so the call
  * lands as a bare `/messages` 404. Worse, the `OPENAI_BASE_URL` /
  * `ANTHROPIC_BASE_URL` env vars are bypassed by opencode's `resolveSDK()`
- * (it always passes `options.baseURL` to the @ai-sdk factory, and the
- * @ai-sdk `loadOptionalSetting()` only consults the env var when the
- * factory receives an undefined `baseURL`). Every other @ai-sdk provider
- * (google, mistral, groq, cohere, xai, perplexity, togetherai, vercel,
- * alibaba, deepinfra, gateway, openrouter, cerebras, etc.) has NO
- * baseURL env var at all. Iterating over `cfg.provider` is the only
- * universal lever.
+ * (it always passes the factory a baseURL, and @ai-sdk's
+ * `loadOptionalSetting()` only consults the env var when the factory
+ * receives an undefined `baseURL`). Every other @ai-sdk provider (google,
+ * mistral, groq, cohere, xai, perplexity, togetherai, vercel, alibaba,
+ * deepinfra, gateway, openrouter, cerebras, etc.) has NO baseURL env var at
+ * all. Pinning the live provider inventory is the only universal lever.
  *
- * Deep-merges per-provider so user-set keys under `provider.<id>` (custom
- * headers, model overrides, etc.) are preserved.
+ * v2 shape: the pre-2.x plugin did this by mutating `cfg.provider` in the
+ * `config` hook (`options.baseURL`); v2 exposes no mutable global config, so
+ * this runs as a provider-domain transform over the editor's live inventory.
+ * Transforms are replayed on every registry rebuild, so providers discovered
+ * after setup (e.g. post-auth account inventories) are pinned on the next
+ * rebuild too — as long as the transform stays cheap and repeatable, which
+ * a per-provider settings assignment is.
  *
- * Exported for direct testing — the config hook delegates here so unit tests
- * can verify the merge logic without spinning up a real gateway (the
- * surrounding `LorePlugin` skips gateway start in `NODE_ENV=test`).
+ * Per-provider, existing settings keys are preserved (assign a merged
+ * settings object; never clobber user-set keys). Providers named `openai`
+ * or `openai-codex` additionally get `headerTimeout: false`: Lore can take
+ * longer than OpenCode's Codex 10s header deadline while it prepares
+ * context, and OpenCode installs its own default before plugins run, so
+ * Lore must override rather than preserve that value. The gateway owns the
+ * foreground request deadline.
+ *
+ * Difference from the pre-2.x helper (deliberate): the old code also CREATED
+ * a synthetic `pinned.openai` when no openai provider was configured. v2's
+ * editor can add providers, but a synthetic one would carry no models and
+ * no package inventory, and the gateway routes every request regardless —
+ * so the fallback is dropped (see the PR's open questions).
+ *
+ * Exported for direct testing — tests pass a fake editor and verify the
+ * merge logic without spinning up a real gateway.
  */
-export function applyLoreProviderConfig(
-  cfg: Record<string, unknown>,
+export function applyLoreProviderSettings(
+  editor: LoreProviderEditorLike,
   gatewayBase: string,
 ): void {
   if (!gatewayBase) return;
   const baseUrl = `${gatewayBase}/v1`;
-  const existingProvider = (cfg.provider ?? {}) as Record<string, unknown>;
-  const pinned: Record<string, unknown> = {};
-  for (const [id, provider] of Object.entries(existingProvider)) {
-    if (!provider || typeof provider !== "object") continue;
-    const p = provider as Record<string, unknown>;
-    const existingOptions = (p.options ?? {}) as Record<string, unknown>;
-    pinned[id] = {
-      ...p,
-      options: {
-        ...existingOptions,
+  for (const record of editor.list()) {
+    const id = record.provider.id;
+    void editor.update(id, (provider) => {
+      const p = provider as {
+        settings?: Record<string, unknown>;
+      };
+      p.settings = {
+        ...p.settings,
         baseURL: baseUrl,
-        // Lore can take longer than OpenCode's Codex 10s header deadline while
-        // it prepares context. OpenCode installs its own default before this
-        // hook runs, so Lore must override it rather than preserve that value.
-        // The gateway owns the foreground request deadline.
         ...(id === "openai" || id === "openai-codex"
           ? { headerTimeout: false }
           : {}),
-      },
-    };
+      };
+    });
   }
-  if (!pinned.openai) {
-    pinned.openai = {
-      options: { baseURL: baseUrl, headerTimeout: false },
-    };
-  }
-  cfg.provider = { ...existingProvider, ...pinned };
 }
 
 /**
@@ -246,40 +257,29 @@ export async function prepareLocalUiAssets(): Promise<void> {
 }
 
 /**
- * Surface a fatal "Lore is unavailable" condition to the user.
- *
- * In embedded/TUI mode the core logger's stderr is hard-silenced (see
- * `log.silenceStderr()` at plugin activation), so `log.error` alone lands only
- * in the log file + Sentry sink — invisible to a user sitting inside OpenCode's
- * full-screen TUI. A toast is the one channel that is BOTH user-visible and
- * TUI-safe: `showToast` posts to the OpenCode server over HTTP and is rendered
- * inside the TUI's own render loop, so it never writes a raw byte to the
- * terminal and cannot corrupt the screen (unlike the `process.stderr.write`
- * this replaced).
- *
- * Fire-and-forget and swallow EVERY failure: a missing/headless TUI, or an
- * older server without the `/tui/show-toast` route, must never turn a
- * degraded-but-running session into a crash.
+ * Native recall reads the host's local database. Keep it available only when
+ * model traffic goes to a local gateway, never a remote target.
+ * (Ported from the pre-rebase upstream internal.ts.)
  */
-export function surfaceGatewayUnavailable(
-  client: PluginInput["client"] | undefined,
-  message: string,
-): void {
+export function shouldRegisterNativeRecallTool(
+  gatewayBase: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return isLoopbackUrl(gatewayBase) && !isRemoteGatewayTarget(gatewayBase, env);
+}
+
+/**
+ * Surface a fatal "Lore is unavailable" condition.
+ *
+ * The pre-2.x plugin ALSO raised a TUI-safe toast via the SDK client
+ * (`client.tui.showToast`): in embedded/TUI mode the core logger's stderr is
+ * hard-silenced (see `log.silenceStderr()` at plugin activation), so
+ * `log.error` alone lands only in the log file + Sentry sink — invisible to
+ * a user sitting inside OpenCode's full-screen TUI. The v2 server-plugin
+ * context has no toast/notification channel, so this is log-only for now;
+ * `lore logs` remains the way to see it (see the PR's open questions).
+ */
+export function reportGatewayUnavailable(message: string): void {
   // File + Sentry sink (silenced on stderr in embedded mode).
   log.error(message);
-  try {
-    const pending = client?.tui?.showToast({
-      body: { title: "Lore", message, variant: "error" },
-    });
-    // The SDK call defaults to throwOnError=false (resolves rather than
-    // rejects), but guard `.catch` defensively in case a mock/older client
-    // returns a bare promise — a rejected toast must never bubble up.
-    (
-      pending as
-        | { catch?: (cb: (reason: unknown) => void) => unknown }
-        | undefined
-    )?.catch?.(() => {});
-  } catch {
-    // showToast threw synchronously — never propagate a notification failure.
-  }
 }

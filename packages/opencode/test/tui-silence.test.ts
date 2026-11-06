@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "vitest";
-import type { PluginInput } from "@opencode-ai/plugin";
 import { log } from "@loreai/core";
 import { LorePlugin } from "../src/index";
+import { createMockContext } from "./helpers";
 
 /**
  * The OpenCode plugin runs inside OpenCode's full-screen TUI, where any byte on
@@ -34,16 +34,9 @@ describe("opencode plugin — TUI stderr silencing on activation", () => {
     process.env.LORE_OPENCODE_FORCE_ACTIVE = "1";
     process.env.LORE_DISABLED = "1";
 
-    await LorePlugin({
-      client: {
-        tui: { showToast: () => Promise.resolve() },
-      } as unknown as PluginInput["client"],
-      project: { id: "tui-silence" } as unknown as PluginInput["project"],
-      directory: process.cwd(),
-      worktree: process.cwd(),
-      serverUrl: new URL("http://localhost:0"),
-      $: {} as unknown as PluginInput["$"],
-    });
+    const { ctx } = createMockContext({ directory: process.cwd() });
+    const cleanup = await LorePlugin.setup(ctx);
+    if (cleanup) await cleanup();
 
     expect(log.isStderrSilenced()).toBe(true);
   });
