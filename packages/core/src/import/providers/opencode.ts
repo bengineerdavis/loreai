@@ -79,6 +79,66 @@ type PartData = {
   };
 };
 
+/**
+ * A v2 content part, as stored inline in `session_message.data.content`.
+ *
+ * OpenCode 2.x stopped writing `message`/`part` rows and began writing
+ * `session_message`, where an assistant message carries its parts in a JSON
+ * array rather than in a sibling table. The two schemas describe the same
+ * conversation, so the v2 shape is flattened into the v1 `PartData` shape
+ * here and the rest of the provider runs unchanged.
+ */
+type V2ContentPart = {
+  type?: string;
+  text?: string;
+  /** v2 names the tool on the part itself, not under `state`. */
+  name?: string;
+  state?: {
+    status?: string;
+    /** v2 puts tool output in `content`, a list of text parts. */
+    content?: Array<{ type?: string; text?: string } | string>;
+    output?: string;
+  };
+};
+
+/** Join a v2 tool part's content list into one string. */
+function v2ToolOutput(part: V2ContentPart): string {
+  const content = part.state?.content;
+  if (typeof part.state?.output === "string") return part.state.output;
+  if (!Array.isArray(content)) return "";
+  const segments: string[] = [];
+  for (const item of content) {
+    if (typeof item === "string") segments.push(item);
+    else if (item?.text) segments.push(item.text);
+  }
+  return segments.join("\n");
+}
+
+/**
+ * Flatten one v2 message's inline content array into conversation text.
+ *
+ * Only `text` parts and completed `tool` parts contribute, matching the v1
+ * path's choice to skip reasoning, step-start and other non-text parts.
+ */
+function v2ContentToConversationText(content: V2ContentPart[]): string {
+  const parts: PartData[] = [];
+  for (const part of content) {
+    if (part?.type === "text" && part.text) {
+      parts.push({ type: "text", text: part.text });
+    } else if (part?.type === "tool" && part.name) {
+      parts.push({
+        type: "tool",
+        tool: part.name,
+        state: {
+          status: part.state?.status ?? "",
+          output: v2ToolOutput(part),
+        },
+      });
+    }
+  }
+  return partsToConversationText(parts);
+}
+
 /** Convert part data rows into conversation text. */
 function partsToConversationText(parts: PartData[]): string {
   const segments: string[] = [];
@@ -113,16 +173,21 @@ const opencodeProvider: AgentHistoryProvider = {
     if (!database) return [];
 
     try {
-      // Check required tables exist
-      if (
-        !tableExists(database, "project") ||
-        !tableExists(database, "session") ||
-        !tableExists(database, "message")
-      ) {
+      if (projectPaths.length === 0) return [];
+
+      // OpenCode 2.x moved conversations to `session_v2`/`session_message` and
+      // stopped writing `session`/`message`. Read whichever schema the database
+      // actually has, preferring v2 so a converted database imports everything.
+      const hasV2 =
+        tableExists(database, "session_v2") &&
+        tableExists(database, "session_message");
+      const hasV1 =
+        tableExists(database, "session") && tableExists(database, "message");
+
+      // `project` predates both and is still written by v2.
+      if (!tableExists(database, "project") || (!hasV2 && !hasV1)) {
         return [];
       }
-
-      if (projectPaths.length === 0) return [];
 
       // Find the project(s) by worktree path — a repo's history may live under
       // the main checkout or any sibling worktree/clone path.
@@ -135,12 +200,17 @@ const opencodeProvider: AgentHistoryProvider = {
       const projectIds = projectRows.map((r) => r.id);
       const sessPlaceholders = projectIds.map(() => "?").join(", ");
 
+      // v2 carries the message count in a sibling table the same way v1 does;
+      // only the table names differ — both use `parent_id`.
+      const sessionTable = hasV2 ? "session_v2" : "session";
+      const messageTable = hasV2 ? "session_message" : "message";
+
       // Get sessions with message counts
       const sessions = database
         .query(
           `SELECT s.id, s.title, s.time_created, s.time_updated,
-                  (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) as msg_count
-           FROM session s
+                  (SELECT COUNT(*) FROM ${messageTable} m WHERE m.session_id = s.id) as msg_count
+           FROM ${sessionTable} s
            WHERE s.project_id IN (${sessPlaceholders}) AND s.parent_id IS NULL
            ORDER BY s.time_updated DESC`,
         )
@@ -196,63 +266,108 @@ const opencodeProvider: AgentHistoryProvider = {
 
     try {
       const hasParts = tableExists(database, "part");
+      const hasV2Messages =
+        tableExists(database, "session_v2") &&
+        tableExists(database, "session_message");
 
       for (const sessionId of sessionIds) {
-        // Get messages ordered by time
-        const messages = database
-          .query(
-            `SELECT id, data, time_created FROM message
-             WHERE session_id = ?
-             ORDER BY time_created ASC`,
-          )
-          .all(sessionId) as Array<{
-          id: string;
-          data: string;
-          time_created: number;
-        }>;
-
-        if (messages.length === 0) continue;
-
+        // v2 keeps the whole message, parts included, in `session_message.data`;
+        // v1 splits parts into `part` rows. Both flatten to the same
+        // `[role] text` strings, so only the read differs.
         const textMessages: { text: string; timestamp: number }[] = [];
 
-        for (const msg of messages) {
-          let msgData: { role?: string };
-          try {
-            msgData = JSON.parse(msg.data);
-          } catch {
-            continue;
-          }
+        if (hasV2Messages) {
+          const v2Messages = database
+            .query(
+              `SELECT id, type, data, time_created FROM session_message
+               WHERE session_id = ?
+               ORDER BY seq ASC`,
+            )
+            .all(sessionId) as Array<{
+            id: string;
+            type: string;
+            data: string;
+            time_created: number;
+          }>;
 
-          const role = msgData.role ?? "unknown";
-          let contentText = "";
-
-          if (hasParts) {
-            // Read parts for this message
-            const parts = database
-              .query(
-                `SELECT data FROM part
-                 WHERE message_id = ?
-                 ORDER BY time_created ASC`,
-              )
-              .all(msg.id) as Array<{ data: string }>;
-
-            const parsedParts: PartData[] = [];
-            for (const p of parts) {
-              try {
-                parsedParts.push(JSON.parse(p.data) as PartData);
-              } catch {
-                // Skip malformed parts
-              }
+          for (const msg of v2Messages) {
+            let msgData: { text?: string; content?: V2ContentPart[] };
+            try {
+              msgData = JSON.parse(msg.data);
+            } catch {
+              continue;
             }
-            contentText = partsToConversationText(parsedParts);
+
+            // A user message keeps its text at the top level; an assistant
+            // message keeps it in `content`. Both are conversation turns.
+            let contentText: string;
+            if (Array.isArray(msgData.content)) {
+              contentText = v2ContentToConversationText(msgData.content);
+            } else {
+              contentText = msgData.text ?? "";
+            }
+
+            if (!contentText.trim()) continue;
+            textMessages.push({
+              text: `[${msg.type ?? "unknown"}] ${contentText}`,
+              timestamp: msg.time_created,
+            });
           }
+        } else {
+          // Get messages ordered by time
+          const messages = database
+            .query(
+              `SELECT id, data, time_created FROM message
+               WHERE session_id = ?
+               ORDER BY time_created ASC`,
+            )
+            .all(sessionId) as Array<{
+            id: string;
+            data: string;
+            time_created: number;
+          }>;
 
-          if (!contentText.trim()) continue;
+          if (messages.length === 0) continue;
 
-          textMessages.push({
-            text: `[${role}] ${contentText}`,
-            timestamp: msg.time_created,
-          });
+          for (const msg of messages) {
+            let msgData: { role?: string };
+            try {
+              msgData = JSON.parse(msg.data);
+            } catch {
+              continue;
+            }
+
+            const role = msgData.role ?? "unknown";
+            let contentText = "";
+
+            if (hasParts) {
+              // Read parts for this message
+              const parts = database
+                .query(
+                  `SELECT data FROM part
+                   WHERE message_id = ?
+                   ORDER BY time_created ASC`,
+                )
+                .all(msg.id) as Array<{ data: string }>;
+
+              const parsedParts: PartData[] = [];
+              for (const p of parts) {
+                try {
+                  parsedParts.push(JSON.parse(p.data) as PartData);
+                } catch {
+                  // Skip malformed parts
+                }
+              }
+              contentText = partsToConversationText(parsedParts);
+            }
+
+            if (!contentText.trim()) continue;
+
+            textMessages.push({
+              text: `[${role}] ${contentText}`,
+              timestamp: msg.time_created,
+            });
+          }
         }
 
         if (textMessages.length === 0) continue;
