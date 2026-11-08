@@ -544,8 +544,20 @@ export const LorePlugin = Plugin.define({
                 agent.description = worker.description;
               });
             } else {
+              // KNOWN GAP (see the PR's open questions): the v2 AgentEditor
+              // has no add() and the plugin context has no config domain,
+              // so the plugin cannot create agents. On opencode 1.x the
+              // config hook created them via cfg.agent; under v2 they must
+              // come from host config (key `agents` in v2, `agent` in 1.x —
+              // the same version skew as plugin/plugins). Until that lands,
+              // lore-distill callers (eval/backfill) reference an agent
+              // that does not exist on a plain host.
               log.warn(
-                `agent ${worker.id} does not exist yet — v2 has no agent-creation path; skipping`,
+                `agent ${worker.id} is not registered in this OpenCode instance — ` +
+                  "the v2 plugin API has no agent-creation path; add it to host " +
+                  'config as mode:"subagent", hidden:true (or run the v2 gateway ' +
+                  "writer once it emits the v2 `agents` key) and it will be " +
+                  "configured automatically",
               );
             }
           }
