@@ -14,15 +14,24 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from "vitest";
 
 import { Database } from "#db/driver";
+import type { AgentHistoryProvider } from "../../src/import/types";
 
 const WORKTREE = "/tmp/v2-fixture-repo";
 
 let home: string;
 let previousXdg: string | undefined;
-let provider: typeof import("../../src/import/providers").AgentHistoryProvider;
+let provider: AgentHistoryProvider;
 
 /** Point the provider's DB path at a disposable directory. */
 function useHome(path: string): void {
@@ -188,7 +197,7 @@ describe("OpenCode provider — v2 schema", () => {
   test("readChunks reads text and tool output from inline content", () => {
     buildV2Database();
     const chunks = provider.readChunks(WORKTREE, ["ses-v2"]);
-    const text = chunks.map((c) => c.text).join("\n");
+    const text = chunks.map((c: { text: string }) => c.text).join("\n");
 
     expect(text).toContain("[user] what does the reader want");
     expect(text).toContain("[assistant] reading the schema");
@@ -235,7 +244,7 @@ describe("OpenCode provider — v1 still works", () => {
   test("readChunks reads text parts from the part table", () => {
     buildV1Database();
     const chunks = provider.readChunks(WORKTREE, ["ses-v1"]);
-    const text = chunks.map((c) => c.text).join("\n");
+    const text = chunks.map((c: { text: string }) => c.text).join("\n");
 
     expect(text).toContain("v1 message 0");
     expect(text).toContain("v1 message 2");

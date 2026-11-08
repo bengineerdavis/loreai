@@ -6,6 +6,8 @@
  */
 import type { AgentHistoryProvider } from "../types";
 
+export type { AgentHistoryProvider };
+
 const providers: AgentHistoryProvider[] = [];
 
 /** Register a provider. Called at module load time by each provider module. */
