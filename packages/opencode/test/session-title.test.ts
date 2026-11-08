@@ -11,7 +11,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { LorePlugin } from "../src/index";
 import { createMockContext, runModelRequest } from "./helpers";
 
@@ -33,6 +33,22 @@ async function headersFor(
   return runModelRequest(hook, { sessionID });
 }
 
+/**
+ * The session-info lookup is fire-and-forget, so a title only appears on a
+ * LATER hook invocation after the async lookup lands. Keep invoking until
+ * it does.
+ */
+async function waitForTitle(
+  hook: Parameters<typeof runModelRequest>[0],
+  sessionID: string,
+  expected: string,
+): Promise<void> {
+  await vi.waitFor(async () => {
+    const headers = await headersFor(hook, sessionID);
+    expect(headers["x-lore-session-title"]).toBe(expected);
+  });
+}
+
 describe("OpenCode plugin — session title forwarding (#1921)", () => {
   let tmpDirs: string[] = [];
   function makeTmp(label: string): string {
@@ -52,17 +68,17 @@ describe("OpenCode plugin — session title forwarding (#1921)", () => {
   });
 
   test("forwards the session title percent-encoded", async () => {
-    const { hook, mock, cleanup } = await initPlugin(makeTmp("enc"), {
+    const { hook, cleanup } = await initPlugin(makeTmp("enc"), {
       titles: { s1: "Fix the Ünïcode bug" },
     });
     try {
-      const headers = await headersFor(hook, "s1");
-      expect(headers["x-lore-session-title"]).toBe(
-        "Fix%20the%20%C3%9Cn%C3%AFcode%20bug",
-      );
+      const first = await headersFor(hook, "s1");
+      // Fire-and-forget lookup: the title cannot be present on the first
+      // turn's headers.
+      expect(first["x-lore-session-title"]).toBeUndefined();
+      await waitForTitle(hook, "s1", "Fix%20the%20%C3%9Cn%C3%AFcode%20bug");
     } finally {
       if (cleanup) await cleanup();
-      void mock;
     }
   });
 
@@ -76,13 +92,13 @@ describe("OpenCode plugin — session title forwarding (#1921)", () => {
     try {
       const first = await headersFor(hook, "ph");
       expect(first["x-lore-session-title"]).toBeUndefined();
+      await vi.waitFor(() => expect(calls).toEqual(["ph"]));
       // Placeholder is kept but polled: the real title may land any turn.
       titles.ph = "Investigate FTS tokenizer";
       const second = await headersFor(hook, "ph");
+      expect(second["x-lore-session-title"]).toBeUndefined();
+      await waitForTitle(hook, "ph", "Investigate%20FTS%20tokenizer");
       expect(calls).toEqual(["ph", "ph"]);
-      expect(second["x-lore-session-title"]).toBe(
-        "Investigate%20FTS%20tokenizer",
-      );
     } finally {
       if (cleanup) await cleanup();
     }
@@ -96,11 +112,9 @@ describe("OpenCode plugin — session title forwarding (#1921)", () => {
     });
     try {
       await headersFor(hook, "real");
-      const again = await headersFor(hook, "real");
+      await waitForTitle(hook, "real", "Refactor%20the%20sync%20outbox");
+      await headersFor(hook, "real");
       expect(calls).toEqual(["real"]);
-      expect(again["x-lore-session-title"]).toBe(
-        "Refactor%20the%20sync%20outbox",
-      );
     } finally {
       if (cleanup) await cleanup();
     }
@@ -110,9 +124,9 @@ describe("OpenCode plugin — session title forwarding (#1921)", () => {
     const calls: string[] = [];
     const { hook, cleanup } = await initPlugin(makeTmp("none"), { calls });
     try {
-      const first = await headersFor(hook, "none");
+      await headersFor(hook, "none");
+      await vi.waitFor(() => expect(calls).toEqual(["none"]));
       const second = await headersFor(hook, "none");
-      expect(first["x-lore-session-title"]).toBeUndefined();
       expect(second["x-lore-session-title"]).toBeUndefined();
       expect(calls).toEqual(["none"]);
     } finally {

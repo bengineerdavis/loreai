@@ -13,7 +13,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { LorePlugin } from "../src/index";
 import {
   createMockContext,
@@ -37,6 +37,23 @@ async function headersFor(
   sessionID: string,
 ): Promise<Record<string, string>> {
   return runModelRequest(hook, { sessionID });
+}
+
+/**
+ * The parent lookup is fire-and-forget (session metadata must never delay a
+ * provider request), so a header only appears on a LATER hook invocation,
+ * after the async lookup has landed. Keep invoking the hook until it does.
+ */
+async function waitForHeader(
+  hook: CapturedHook,
+  sessionID: string,
+  name: string,
+  expected: string,
+): Promise<void> {
+  await vi.waitFor(async () => {
+    const headers = await headersFor(hook, sessionID);
+    expect(headers[name]).toBe(expected);
+  });
 }
 
 describe("OpenCode plugin — sub-agent detection (#1300)", () => {
@@ -64,21 +81,37 @@ describe("OpenCode plugin — sub-agent detection (#1300)", () => {
     });
     try {
       const headers = await headersFor(hook, "sa-child-1");
-      expect(headers["x-parent-session-id"]).toBe("sa-parent-1");
-      // Sanity: the normal session header is still the child's own id.
       expect(headers["x-lore-session-id"]).toBe("sa-child-1");
+      // Fire-and-forget lookup: the first turn reports the conservative
+      // pending state while the async resolution is in flight.
+      expect(headers["x-lore-session-parent-state"]).toBe("pending");
+      await waitForHeader(
+        hook,
+        "sa-child-1",
+        "x-parent-session-id",
+        "sa-parent-1",
+      );
     } finally {
       if (cleanup) await cleanup();
     }
   });
 
-  test("primary session (no parentID) emits no x-parent-session-id", async () => {
+  test("primary session stays pending until the async lookup resolves", async () => {
     const dir = makeTmp("primary");
-    const { hook, cleanup } = await initPlugin(dir, {});
+    const calls: string[] = [];
+    const { hook, cleanup } = await initPlugin(dir, { calls });
     try {
       const headers = await headersFor(hook, "primary-1");
       expect(headers["x-parent-session-id"]).toBeUndefined();
       expect(headers["x-lore-session-id"]).toBe("primary-1");
+      expect(headers["x-lore-session-parent-state"]).toBe("pending");
+      await vi.waitFor(() => expect(calls).toEqual(["primary-1"]));
+      // Once the async lookup has confirmed a primary session (parentID
+      // null), the state clears — without a second session.get call.
+      const resolvedHeaders = await headersFor(hook, "primary-1");
+      expect(resolvedHeaders["x-parent-session-id"]).toBeUndefined();
+      expect(resolvedHeaders["x-lore-session-parent-state"]).toBe("primary");
+      expect(calls).toEqual(["primary-1"]);
     } finally {
       if (cleanup) await cleanup();
     }
@@ -92,10 +125,14 @@ describe("OpenCode plugin — sub-agent detection (#1300)", () => {
       calls,
     });
     try {
-      for (let i = 0; i < 3; i++) {
-        const headers = await headersFor(hook, "cache-child");
-        expect(headers["x-parent-session-id"]).toBe("cache-parent");
-      }
+      await headersFor(hook, "cache-child");
+      await waitForHeader(
+        hook,
+        "cache-child",
+        "x-parent-session-id",
+        "cache-parent",
+      );
+      await headersFor(hook, "cache-child");
       expect(calls.filter((id) => id === "cache-child")).toHaveLength(1);
     } finally {
       if (cleanup) await cleanup();
@@ -115,10 +152,16 @@ describe("OpenCode plugin — sub-agent detection (#1300)", () => {
       expect(h1["x-parent-session-id"]).toBeUndefined();
       expect(h1["x-lore-session-id"]).toBe("retry-child");
 
-      // Turn 2: server recovers — the failure was not cached, so it resolves now.
+      // The first failure is not cached; once the server recovers, a later
+      // turn retries and the following turn observes the refreshed metadata.
       down = false;
-      const h2 = await headersFor(hook, "retry-child");
-      expect(h2["x-parent-session-id"]).toBe("retry-parent");
+      await headersFor(hook, "retry-child");
+      await waitForHeader(
+        hook,
+        "retry-child",
+        "x-parent-session-id",
+        "retry-parent",
+      );
     } finally {
       if (cleanup) await cleanup();
     }

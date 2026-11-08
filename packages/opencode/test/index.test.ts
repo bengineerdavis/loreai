@@ -1,4 +1,4 @@
-import { describe, test, expect } from "vitest";
+import { describe, test, expect, vi } from "vitest";
 import { LorePlugin } from "../src/index";
 import { applyLoreProviderSettings } from "../src/internal";
 import {
@@ -236,18 +236,20 @@ describe("model.request hook", () => {
     );
     if (!hook) throw new Error("model.request hook was not registered");
 
-    const headers = await runModelRequest(hook, {
-      sessionID: "ses_child",
-    });
+    const first = await runModelRequest(hook, { sessionID: "ses_child" });
+    // Fire-and-forget lookup: parent/title cannot be present on turn 1.
+    expect(first["x-lore-session-id"]).toBe("ses_child");
+    expect(first["x-lore-agent"]).toBe("build");
+    expect(first["x-lore-provider"]).toBe("anthropic");
+    expect(first["x-lore-project"]).toBe("/tmp/lore-test");
+    expect(first["x-lore-session-parent-state"]).toBe("pending");
 
-    expect(headers["x-lore-session-id"]).toBe("ses_child");
-    expect(headers["x-lore-agent"]).toBe("build");
-    expect(headers["x-lore-provider"]).toBe("anthropic");
-    expect(headers["x-lore-project"]).toBe("/tmp/lore-test");
-    // Sub-agent parent forwarding (#1300): ses_child's parentID is ses_parent.
-    expect(headers["x-parent-session-id"]).toBe("ses_parent");
-    // Harness title forwarding (#1921), percent-encoded.
-    expect(headers["x-lore-session-title"]).toBe("Child%20task");
+    // Once the async lookup lands, the parent and title headers appear.
+    await vi.waitFor(async () => {
+      const headers = await runModelRequest(hook, { sessionID: "ses_child" });
+      expect(headers["x-parent-session-id"]).toBe("ses_parent");
+      expect(headers["x-lore-session-title"]).toBe("Child%20task");
+    });
   });
 
   test("suppresses placeholder titles", async () => {

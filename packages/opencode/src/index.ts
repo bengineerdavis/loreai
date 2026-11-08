@@ -213,12 +213,18 @@ const sessionParent = new Map<
     lastSeenAt: number;
   }
 >();
+/** In-flight (or recently finished) session-info lookups, keyed the same as
+ * `sessionParent`. Deduplicates concurrent lookups for one session and
+ * carries the timeout race that bounds them. */
+const sessionInfoLookups = new Map<string, Promise<void>>();
 
 /** OpenCode's default title before it generates a real one. */
 const PLACEHOLDER_TITLE_RE = /^new session\b/i;
 /** Re-check a real (non-placeholder) title at most this often — a session
  * can be renamed mid-flight, but titles are not worth polling per turn. */
 const TITLE_REFETCH_MS = 5 * 60 * 1000;
+/** Bound optional metadata lookups so a hung SDK call cannot suppress retries. */
+const SESSION_INFO_LOOKUP_TIMEOUT_MS = 5_000;
 
 function reapStaleSessionParent(): void {
   const cutoff = Date.now() - SESSION_STATE_TTL_MS;
@@ -241,6 +247,10 @@ function applySessionInfo(
   entry.titleFetchedAt = Date.now();
 }
 
+function sessionInfoKey(directory: string, sessionID: string): string {
+  return JSON.stringify([directory, sessionID]);
+}
+
 /**
  * Resolve a session's parent session ID and harness title via the v2
  * session domain (`ctx.session.get({ sessionID })`).
@@ -253,13 +263,19 @@ function applySessionInfo(
  * own `title` is forwarded percent-encoded as `x-lore-session-title` so the
  * gateway can persist it as the session's explicit title (#1921).
  *
- * Cached per session (parentID is immutable). A successful lookup — including
- * the common `null` for a primary session — is cached so we never re-query.
- * Failures (gateway server unreachable, session not yet persisted) are NOT
- * cached and never throw, so a transient error is retried on the next turn
- * rather than permanently latching a real sub-agent as "not a sub-agent".
+ * Cached per workspace and session (parentID is immutable). A successful
+ * lookup — including the common `null` for a primary session — is cached so
+ * we never re-query. Failures (gateway server unreachable, session not yet
+ * persisted) are NOT cached and never throw, so a transient error is retried
+ * on the next turn rather than permanently latching a real sub-agent as
+ * "not a sub-agent".
+ *
+ * The lookup itself is fire-and-forget: session metadata is optional and
+ * must never delay or break a provider request. Callers report
+ * `parentLookupPending` so the gateway can apply the conservative sub-agent
+ * budget until classification resolves (via `x-lore-session-parent-state`).
  */
-async function resolveSessionInfo(
+function resolveSessionInfo(
   session: {
     get(args: { sessionID: string }): Promise<{
       parentID?: string;
@@ -267,13 +283,21 @@ async function resolveSessionInfo(
     }>;
   },
   sessionID: string,
-): Promise<{ parentID: string | null; title: string | null }> {
-  const cached = sessionParent.get(sessionID);
+  directory: string,
+): {
+  parentID: string | null;
+  title: string | null;
+  parentLookupPending: boolean;
+} {
+  const key = sessionInfoKey(directory, sessionID);
+  const cached = sessionParent.get(key);
   if (cached) {
     cached.lastSeenAt = Date.now();
-    // Title refresh policy (#1921): no title at all → final; placeholder →
-    // polled every turn (the real title lands shortly after the first
-    // turn); real title → lazy refresh every TITLE_REFETCH_MS.
+    // Title refresh policy (#1921): a harness that reports no title at all
+    // never gets polled again (treat as final); OpenCode's auto "New session"
+    // placeholder IS polled every turn because the real title is generated
+    // shortly after the first turn; a real title refreshes lazily every
+    // TITLE_REFETCH_MS so a manual rename eventually propagates.
     const needsRefetch =
       cached.title === null
         ? false
@@ -281,33 +305,74 @@ async function resolveSessionInfo(
           ? true
           : Date.now() - cached.titleFetchedAt > TITLE_REFETCH_MS;
     if (!needsRefetch) {
-      return { parentID: cached.parentID, title: cached.title };
+      return {
+        parentID: cached.parentID,
+        title: cached.title,
+        parentLookupPending: false,
+      };
     }
-    try {
-      const res = await session.get({ sessionID });
-      applySessionInfo(cached, res);
-    } catch {
-      // Keep the cached values — a transient failure is not a reason to
-      // drop a title we already know.
-    }
-    return { parentID: cached.parentID, title: cached.title };
-  }
-  try {
-    const res = await session.get({ sessionID });
-    const entry = {
-      parentID: null,
-      title: null,
-      titleFetchedAt: 0,
-      lastSeenAt: Date.now(),
+    fetchSessionInfo(session, sessionID, directory);
+    return {
+      parentID: cached.parentID,
+      title: cached.title,
+      parentLookupPending: false,
     };
-    applySessionInfo(entry, res);
-    sessionParent.set(sessionID, entry);
-    reapStaleSessionParent();
-    return { parentID: entry.parentID, title: entry.title };
-  } catch {
-    // Best-effort: never break or slow the request path on a lookup failure.
-    return { parentID: null, title: null };
   }
+  fetchSessionInfo(session, sessionID, directory);
+  return { parentID: null, title: null, parentLookupPending: true };
+}
+
+function fetchSessionInfo(
+  session: {
+    get(args: { sessionID: string }): Promise<{
+      parentID?: string;
+      title?: string;
+    }>;
+  },
+  sessionID: string,
+  directory: string,
+): void {
+  // Session IDs are scoped by OpenCode's workspace directory; never reuse a
+  // lookup or cached metadata from a different workspace with the same ID.
+  const key = sessionInfoKey(directory, sessionID);
+  if (sessionInfoLookups.has(key)) return;
+
+  // Session metadata is optional: never await it on a provider request. A
+  // failed or timed-out lookup stays uncached so a later turn can retry it.
+  let lookup: Promise<void> | undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const request = Promise.resolve()
+    .then(() => session.get({ sessionID }))
+    .then((res) => {
+      // A timeout or newer lookup owns the slot now; late responses cannot
+      // overwrite metadata resolved by a later turn.
+      if (!lookup || sessionInfoLookups.get(key) !== lookup) return;
+      // The v2 session domain can reject (server unreachable, session not
+      // yet persisted). Such a response cannot establish that the session
+      // has no parent and must be retried.
+      const entry = sessionParent.get(key) ?? {
+        parentID: null,
+        title: null,
+        titleFetchedAt: 0,
+        lastSeenAt: Date.now(),
+      };
+      applySessionInfo(entry, res);
+      sessionParent.set(key, entry);
+      reapStaleSessionParent();
+    })
+    .catch(() => {
+      // Metadata failures must not escape into request handling.
+    });
+  const deadline = new Promise<void>((resolve) => {
+    timeout = setTimeout(resolve, SESSION_INFO_LOOKUP_TIMEOUT_MS);
+  });
+  lookup = Promise.race([request, deadline]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+    if (sessionInfoLookups.get(key) === lookup) {
+      sessionInfoLookups.delete(key);
+    }
+  });
+  sessionInfoLookups.set(key, lookup);
 }
 
 /** Memoized lore init promise — ensures concurrent setup calls don't race. */
@@ -539,12 +604,19 @@ export const LorePlugin = Plugin.define({
           );
           input.headers["x-lore-session-id"] = input.sessionID;
           input.headers["x-lore-agent"] = input.agent;
-          const sessionInfo = await resolveSessionInfo(
+          const sessionInfo = resolveSessionInfo(
             ctx.session,
             input.sessionID,
+            thisProjectPath || ctx.location.directory,
           );
           if (sessionInfo.parentID) {
             input.headers["x-parent-session-id"] = sessionInfo.parentID;
+          } else {
+            // The initial lookup is intentionally fire-and-forget. Tell the
+            // gateway to apply the conservative sub-agent budget until it
+            // can classify a root session and clear that temporary state.
+            input.headers["x-lore-session-parent-state"] =
+              sessionInfo.parentLookupPending ? "pending" : "primary";
           }
           if (
             sessionInfo.title &&
@@ -596,6 +668,15 @@ export const LorePlugin = Plugin.define({
         if (loreActive) {
           installFetchInterceptor({
             gatewayBase,
+            // Feed every outgoing request's headers to the recall client so
+            // it can cache provider credentials observed on the current
+            // turn (correlated via x-lore-session-id / x-lore-provider).
+            // Without this the recall client's credential cache stays empty
+            // and every native lore_recall call fails closed with
+            // "Recall is unavailable for this authenticated session."
+            // (#2065's createGatewayRecallClient contract).
+            onRequestHeaders: (headers) =>
+              nativeRecallClient?.observeRequestHeaders(headers),
             getHeaders: () => {
               const headers: Record<string, string> = {
                 ...gatewayAccessHeadersForRemote(gatewayBase),
